@@ -51,3 +51,14 @@ def test_starlette_server_pins_and_lock_exclude_cve_2026_48710():
     assert len(pins) == 1 and pins[0].operator == "==" and Version(pins[0].version) >= floor
     versions = [Version(row["version"]) for row in lock["package"] if row["name"] == "starlette"]
     assert versions and all(version >= floor for version in versions)
+
+
+def test_pilk_is_exempt_from_exclude_newer():
+    metadata = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pilk = [
+        Requirement(dependency)
+        for dependency in metadata["project"]["optional-dependencies"]["silk"]
+        if Requirement(dependency).name == "pilk"
+    ]
+    assert len(pilk) == 1 and str(pilk[0].specifier) == "==0.2.4"
+    assert metadata["tool"]["uv"]["exclude-newer-package"]["pilk"] is False
