@@ -994,7 +994,7 @@ def _run_post_update_maintenance(
     try:
         # See #95596.
         from hermes_cli.macos_tcc_anchor import ensure_tcc_anchor
-        ensure_tcc_anchor()
+        ensure_tcc_anchor(_m().PROJECT_ROOT)
     except Exception:
         logger.debug("macOS TCC anchor refresh skipped", exc_info=True)
 

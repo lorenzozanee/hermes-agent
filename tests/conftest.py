@@ -35,6 +35,23 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
+@pytest.fixture(autouse=True)
+def _tcc_anchor_never_rewrites_the_checkout(monkeypatch):
+    """No test may anchor this checkout's own venv (#132178)."""
+    import hermes_cli.macos_tcc_anchor as tcc
+
+    checkout = Path(tcc.__file__).resolve().parents[1]
+    ensure_tcc_anchor = tcc.ensure_tcc_anchor
+
+    def guarded(project_root=None):
+        target = tcc._venv_dir(project_root)
+        if target is not None and target.parent.resolve() == checkout:
+            return None
+        return ensure_tcc_anchor(project_root)
+
+    monkeypatch.setattr(tcc, "ensure_tcc_anchor", guarded)
+
 # Every test file runs in its own process, and in a checkout without an install stamp
 # get_version_info() shells out to git 7 times (~0.55 s per process in a large local
 # clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow

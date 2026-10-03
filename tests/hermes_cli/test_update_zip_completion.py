@@ -78,7 +78,10 @@ def zip_update(tmp_path, monkeypatch, isolated_source_completion):
     monkeypatch.setattr("hermes_cli.source_build.build_update_products", prepare)
     # PM/builds and machine-level repair are independently covered. Keep real
     # config migration, profile env backfill, snapshot recovery and receipts.
-    monkeypatch.setattr("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.macos_tcc_anchor.ensure_tcc_anchor",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(maint, "_print_post_update_notices_and_self_heals", lambda: None)
     monkeypatch.setattr(maint, "_print_bundled_skills_sync_report", lambda: None)
     monkeypatch.setattr("hermes_cli.profiles.seed_profile_skills", lambda *a, **kw: {})

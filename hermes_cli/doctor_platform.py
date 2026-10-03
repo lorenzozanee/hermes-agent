@@ -344,12 +344,14 @@ def check_macos_tcc_anchor(should_fix: bool = False) -> None:
     """
     with warn_on_error("macOS TCC anchor check failed"):
         from hermes_cli import macos_tcc_anchor as tcc
-        status, detail = tcc.tcc_anchor_state()
+        from hermes_cli.doctor import PROJECT_ROOT
+
+        status, detail = tcc.tcc_anchor_state(PROJECT_ROOT)
         if status == "skip":
             return
         if status == "active":
             return check_ok("macOS TCC anchor active", f"({detail})")
-        anchored = tcc.ensure_tcc_anchor() if should_fix else None
+        anchored = tcc.ensure_tcc_anchor(PROJECT_ROOT) if should_fix else None
         if anchored is not None:
             return check_ok("macOS TCC anchor installed", f"({anchored})")
         check_warn("macOS TCC anchor missing" if status == "missing" else "macOS TCC anchor stale", f"({detail})")
