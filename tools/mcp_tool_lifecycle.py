@@ -152,62 +152,91 @@ def _reregister_orphaned_adopters() -> None:
                 reset_hermes_home_override(home_token)
 
 
-def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = None,
-                         timeout: float = 15.0):
-    """Close MCP server connections (in parallel) and stop the background loop. Each server
-    Task is signalled to exit its own ``async with`` so the anyio cancel-scope cleanup runs in
-    the Task that opened it. ``scope`` restricts teardown to one multiplexed profile's servers
-    (its ``/reload-mcp`` must not kill other profiles') and leaves the shared loop running if
-    anything else is still connected. ``names`` restricts it further to those server names
-    (dropped-from-config pruning); other servers' bookkeeping is untouched. Only the bare call
-    (no ``scope``, no ``names``) is the process-wide wildcard: the launch profile's registry
-    scope IS ``None``, so ``scope=None, names={...}`` prunes that unscoped owner's servers and
-    must leave a served profile's same-named ``(B, name)`` connection alone. ``timeout`` bounds
-    the wait for the close to land on the MCP loop — a caller running one pass per served
-    profile under a total budget divides it, or N profiles × 15s starve the wildcard pass that
-    actually stops the loop."""
-    from tools.mcp_tool_scope import _key_name
-    wildcard = scope is None and names is None
+def shutdown_mcp_servers(
+    *, scope: Optional[str] = None, names: Optional[set] = None,
+    session_id: Optional[str] = None, stale_session: bool = False, timeout: float = 15.0,
+):
+    """Close selected MCP connections and clear their retry and lazy state.
+
+    A bare call is process-wide. Profile shutdown only selects profile-owned connections;
+    session_id selects one ACP session within its profile. With stale_session=True,
+    only session keys that no longer match the active session cwd/config are removed.
+    """
+    from tools.mcp_tool_scope import (
+        _key_matches_current_session, _key_name, _key_scope, _key_session,
+    )
+
+    wildcard = scope is None and names is None and session_id is None
+
+    def _owned(key) -> bool:
+        if session_id is not None:
+            return _key_session(key) == session_id and _key_scope(key) == scope
+        if wildcard:
+            return True
+        return _key_session(key) is None and _core._server_scope_keys.get(key, _key_scope(key)) == scope
+
+    def _selected(key) -> bool:
+        if not _owned(key):
+            return False
+        if names is not None and _key_name(key) not in names:
+            return False
+        return not stale_session or not _key_matches_current_session(key)
+
     with _core._lock:
-        selected = [key for key in _core._servers if wildcard or _core._server_scope_keys.get(key) == scope]
-        if names is not None:
-            selected = [key for key in selected if _key_name(key) in names]
+        selected = [key for key in _core._servers if _selected(key)]
         servers_snapshot = [_core._servers[key] for key in selected]
-        if names is not None:
-            selected_status = set(selected)
-        elif wildcard:
-            selected_status = (
-                set(_core._servers) | set(_core._server_scope_keys)
-                | set(_core._server_tool_scopes)
-                | set(_core._server_connecting) | set(_core._server_connect_errors))
-        else:
-            selected_status = {key for key, owner in _core._server_scope_keys.items() if owner == scope}
-        # Adopters of the connections being torn down lose their overlays with the tasks' own
-        # ``_deregister_tools``; remember them so the next discovery pass re-registers them
-        # (``_reregister_orphaned_adopters``).
-        if not wildcard:
+        all_status_keys = (
+            set(_core._servers) | set(_core._server_scope_keys)
+            | set(_core._server_tool_scopes) | set(_core._server_connecting)
+            | set(_core._server_connect_errors) | set(_core._lazy_server_configs)
+            | set(_core._lazy_server_tool_names)
+            | set(_core._server_connect_retry_after) | set(_core._server_connect_failures)
+        )
+        selected_status = {key for key in all_status_keys if _selected(key)}
+        selected_lazy = [key for key in _core._lazy_server_configs if _selected(key)]
+        if not wildcard and session_id is None:
             for key in selected:
                 for adopter in _core._server_tool_scopes.get(key, ()):
                     if adopter != scope:
                         _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
 
-    def clear_selected_status():
-        _core._server_connecting.difference_update(selected_status)
-        for key in selected_status:
+    if selected_lazy:
+        from tools.mcp_tool_discovery import _forget_lazy_server
+
+        for key in selected_lazy:
+            _forget_lazy_server(key)
+
+    def clear_selected_status(keys=selected_status):
+        _core._server_connecting.difference_update(keys)
+        for key in keys:
             _core._server_connect_errors.pop(key, None)
             _core._server_scope_keys.pop(key, None)
             _core._server_tool_scopes.pop(key, None)
 
-    # Fast path: nothing to shut down. The connect-cooldown maps can still be populated here — a server that
-    # failed to connect is never recorded in ``_servers`` (that is the very premise of the #50394 cooldown),
-    # so "no live servers" is the MOST likely state in which stale backoff entries exist. Clear them so a
-    # post-shutdown restart re-attempts every configured server immediately.
     if servers_snapshot:
         async def _shutdown():
-            results = await asyncio.gather(*(server.shutdown() for server in servers_snapshot), return_exceptions=True)
+            results = await asyncio.gather(
+                *(server.shutdown() for server in servers_snapshot), return_exceptions=True,
+            )
+            failures = []
             for server, result in zip(servers_snapshot, results):
-                if isinstance(result, Exception):
-                    logger.debug("Error closing MCP server '%s': %s", server.name, result)
+                if isinstance(result, BaseException):
+                    failures.append((server, result))
+                    logger.error("Error closing MCP server '%s': %s", server.name, result)
+            if failures:
+                failed_servers = {id(server) for server, _ in failures}
+                closed_keys = {
+                    key for key, server in zip(selected, servers_snapshot)
+                    if id(server) not in failed_servers
+                }
+                with _core._lock:
+                    for key in closed_keys:
+                        _core._servers.pop(key, None)
+                        _core._server_scope_keys.pop(key, None)
+                    clear_selected_status(closed_keys)
+                    _clear_connect_cooldowns(closed_keys)
+                server, exc = failures[0]
+                raise RuntimeError(f"Failed to close MCP server '{server.name}'") from exc
             with _core._lock:
                 for key in selected:
                     _core._servers.pop(key, None)
@@ -217,27 +246,32 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
 
         with _core._lock:
             loop = _core._mcp_loop
-        if loop is not None and loop.is_running():
-            from agent.async_utils import safe_schedule_threadsafe
-            future = safe_schedule_threadsafe(_shutdown(), loop, logger=logger, log_message="MCP shutdown: failed to schedule")
-            if future is not None:
-                try:
-                    future.result(timeout=timeout)
-                except BaseException as exc:
-                    logger.debug("Error during MCP shutdown: %s", exc)
+        if loop is None or not loop.is_running():
+            raise RuntimeError("MCP loop is not running; live servers could not be closed")
+        from agent.async_utils import safe_schedule_threadsafe
+        future = safe_schedule_threadsafe(
+            _shutdown(), loop, logger=logger, log_message="MCP shutdown: failed to schedule",
+        )
+        if future is None:
+            raise RuntimeError("MCP shutdown could not be scheduled")
+        shutdown_error = None
+        try:
+            future.result(timeout=timeout)
+        except BaseException as exc:
+            shutdown_error = exc
+        if shutdown_error is not None:
+            if wildcard:
+                _loop._stop_mcp_loop(only_if_idle=False)
+            raise RuntimeError("MCP server shutdown failed; live connection state was retained") from shutdown_error
 
-    # Unconditional final sweep: whether ``_shutdown`` ran, timed out, or was never scheduled
-    # (a server that failed to connect is never in ``_servers`` — the most likely state for
-    # stale backoff entries), no connect-cooldown state may survive shutdown.
     with _core._lock:
         if not servers_snapshot:
             clear_selected_status()
         _clear_connect_cooldowns(None if wildcard else selected_status)
     _loop._stop_mcp_loop(only_if_idle=not wildcard)
-    # A removed subset still shares its profile's log with the remaining servers.
-    # Full/profile shutdown must also release handles left by completed CLI/UI probes.
-    if names is None:
+    if names is None and session_id is None:
         from tools.mcp_tool_config import _close_mcp_stderr_logs
+
         _close_mcp_stderr_logs(scope=scope)
 
 

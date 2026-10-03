@@ -112,13 +112,19 @@ class SlashCommandsMixin:
         # and ``/model`` REBUILD the system prompt, so unpinned they'd bake the Hermes install tree
         # into the persisted cached prompt. Pin inside a fresh context: no leak, no teardown.
         def _dispatch() -> str | None:
+            from tools.mcp_tool_scope import reset_session_scope, set_session_scope
+
+            scope = set_session_scope(state.session_id, state.cwd, state.mcp_server_fingerprints)
             try:
                 from agent.runtime_cwd import set_session_cwd
 
                 set_session_cwd(state.cwd)
             except Exception:
                 logger.debug("Could not pin ACP session cwd for slash command", exc_info=True)
-            return handler(args, state)
+            try:
+                return handler(args, state)
+            finally:
+                reset_session_scope(scope)
 
         try:
             return contextvars.copy_context().run(_dispatch)

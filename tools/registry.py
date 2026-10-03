@@ -14,6 +14,7 @@ import logging
 import sys
 import threading
 import time
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
@@ -27,6 +28,34 @@ _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 # Logs keep more of the body than the model sees, but still a bounded amount.
 _MAX_LOGGED_ERROR_CHARS = 8192
+
+
+_REGISTRY_SESSION_SCOPE: ContextVar[tuple[str, Optional[str], str] | None] = ContextVar(
+    "tool_registry_session_scope", default=None)
+
+
+def set_registry_session_scope(profile_scope: Optional[str], session_id: str) -> Token:
+    return _REGISTRY_SESSION_SCOPE.set((hermes_home_key(), normalize_scope(profile_scope), session_id))
+
+
+def reset_registry_session_scope(token: Token) -> None:
+    _REGISTRY_SESSION_SCOPE.reset(token)
+
+
+def registry_session_scope_key() -> Optional[tuple[Optional[str], str]]:
+    current = _REGISTRY_SESSION_SCOPE.get()
+    if current is None or current[0] != hermes_home_key():
+        return None
+    return current[1], current[2]
+
+
+def _registry_session_slot(scope: Optional[str], *, for_write: bool = False):
+    current = _REGISTRY_SESSION_SCOPE.get()
+    if current is None or current[0] != hermes_home_key(scope):
+        return None
+    if for_write and normalize_scope(scope) != current[1]:
+        return None
+    return current[1], current[2]
 
 
 def _bound_error_text(text: str) -> str:
@@ -431,6 +460,7 @@ class ToolRegistry:
         self._tools: Dict[str, ToolEntry] = {}  # built-in / process-global registrations
         # Plugin overlays keyed by resolved HERMES_HOME; a profile sees its overlay first.
         self._scoped_tools: Dict[str, Dict[str, ToolEntry]] = {}
+        self._session_scoped_tools: Dict[tuple[Optional[str], str], Dict[str, ToolEntry]] = {}
         # Plugin namespace -> operator opt-in for built-in override (lifecycle-managed);
         # scope attribution stays durable after policy removal so delayed callbacks
         # remain confined to the profile that loaded them.
@@ -455,9 +485,16 @@ class ToolRegistry:
             groups.setdefault(entry.toolset, []).append(entry)
         return groups
 
-    def _slot(self, scope: Optional[str], *, create: bool = False) -> Dict[str, ToolEntry]:
-        """The registration map for *scope*: global when None, else that profile's overlay."""
+    def _slot(
+        self, scope: Optional[str], *, create: bool = False, include_session: bool = False
+    ) -> Dict[str, ToolEntry]:
+        """The local registration map for a profile, or for an MCP session when requested."""
         scope = normalize_scope(scope)
+        session_scope = _registry_session_slot(scope, for_write=True) if include_session else None
+        if session_scope is not None:
+            if create:
+                return self._session_scoped_tools.setdefault(session_scope, {})
+            return self._session_scoped_tools.get(session_scope, {})
         if scope is None:
             return self._tools
         if create:
@@ -468,12 +505,31 @@ class ToolRegistry:
         self._toolset_aliases = {
             alias: target for alias, target in self._toolset_aliases.items() if target != toolset}
 
-    def _merged_tools(self, scope: Optional[str] = None) -> Dict[str, ToolEntry]:
-        """Return global tools overlaid with one profile's plugin tools."""
-        return {**self._tools, **self._scoped_tools.get(hermes_home_key(scope), {})}
+    def _merged_tools(
+        self, scope: Optional[str] = None, *, include_session: bool = True
+    ) -> Dict[str, ToolEntry]:
+        """Global tools, overlaid by the active profile and, when requested, ACP session."""
+        home_scope = hermes_home_key(scope)
+        merged = {**self._tools, **self._scoped_tools.get(home_scope, {})}
+        session_scope = _registry_session_slot(scope) if include_session else None
+        if session_scope is not None:
+            merged.update(self._session_scoped_tools.get(session_scope, {}))
+        return merged
 
-    def _toolset_entries(self, toolset: str, scope: Optional[str]) -> List[ToolEntry]:
-        return self._grouped(self._merged_tools(scope).values()).get(toolset, [])
+    def _toolset_exists_anywhere(self, toolset: str) -> bool:
+        return (
+            any(entry.toolset == toolset for entry in self._tools.values())
+            or any(entry.toolset == toolset for tools in self._scoped_tools.values() for entry in tools.values())
+            or any(entry.toolset == toolset
+                   for tools in self._session_scoped_tools.values() for entry in tools.values())
+        )
+
+    def _toolset_entries(
+        self, toolset: str, scope: Optional[str], *, include_session: bool = True
+    ) -> List[ToolEntry]:
+        return self._grouped(
+            self._merged_tools(scope, include_session=include_session).values()
+        ).get(toolset, [])
 
     def _snapshot_state(
         self, scope: Optional[str] = None) -> tuple[List[ToolEntry], Dict[str, Callable]]:
@@ -502,8 +558,13 @@ class ToolRegistry:
             return self._lookup(name, scope or self.current_scope_key())
 
     def _lookup(self, name: str, scope_key: Optional[str]) -> Optional[ToolEntry]:
-        """``_merged_tools(scope_key).get(name)`` without building the merged dict."""
-        scoped = self._scoped_tools.get(scope_key)
+        """Look up a session entry, then its profile overlay, then a global tool."""
+        session_scope = _registry_session_slot(scope_key)
+        if session_scope is not None:
+            session_tools = self._session_scoped_tools.get(session_scope)
+            if session_tools is not None and name in session_tools:
+                return session_tools[name]
+        scoped = self._scoped_tools.get(hermes_home_key(scope_key))
         if scoped is not None and name in scoped:
             return scoped[name]
         return self._tools.get(name)
@@ -512,7 +573,7 @@ class ToolRegistry:
         self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
         """Local slot state only — no global fallback."""
         with self._lock:
-            return self._slot(scope).get(name)
+            return self._slot(scope, include_session=True).get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
         return sorted(self._grouped(self._snapshot_entries()))
@@ -689,8 +750,11 @@ class ToolRegistry:
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         scope = normalize_scope(scope)
+        session_scope = (
+            _registry_session_slot(scope, for_write=True) if toolset.startswith("mcp-") else None
+        )
         with self._lock:
-            target = self._slot(scope, create=True)
+            target = self._slot(scope, create=True, include_session=session_scope is not None)
             existing = self._lookup(name, scope)
             plugin_override_denied = (
                 owner is not None and not self._plugin_override_allowed(scope, owner))
@@ -738,7 +802,7 @@ class ToolRegistry:
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
             # never called) to classify an unavailable toolset as lazy-init vs disabled.
-            if scope is None and check_fn and toolset not in self._toolset_checks:
+            if scope is None and session_scope is None and check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
@@ -762,8 +826,15 @@ class ToolRegistry:
                     "outside its own profile scope.")
             if scope is None:
                 scope = caller_scope
-            target = self._slot(scope)
-            entry = target.get(name)
+            session_scope = _registry_session_slot(scope, for_write=True)
+            session_target = self._slot(scope, include_session=True)
+            entry = session_target.get(name)
+            if entry is not None and entry.toolset.startswith("mcp-"):
+                target = session_target
+            else:
+                session_scope = None
+                target = self._slot(scope)
+                entry = target.get(name)
             if entry is None:
                 if scope is not None and caller_owner is not None and name in self._tools:
                     raise PermissionError(
@@ -792,9 +863,16 @@ class ToolRegistry:
                         f"Plugin module {caller_mod!r} cannot deregister tool {name!r} (toolset "
                         f"{entry.toolset!r}) without operator opt-in (allow_tool_override).")
             del target[name]
-            if scope is not None and not target:
+            if session_scope is not None:
+                if not target:
+                    self._session_scoped_tools.pop(session_scope, None)
+            elif scope is not None and not target:
                 self._scoped_tools.pop(scope, None)
-            if not self._toolset_entries(entry.toolset, scope):
+            if session_scope is not None:
+                if not self._toolset_exists_anywhere(entry.toolset):
+                    self._toolset_checks.pop(entry.toolset, None)
+                    self._drop_toolset_aliases(entry.toolset)
+            elif not self._toolset_entries(entry.toolset, scope, include_session=False):
                 self._toolset_checks.pop(entry.toolset, None)
                 self._drop_toolset_aliases(entry.toolset)
             self._generation += 1
@@ -804,18 +882,28 @@ class ToolRegistry:
         self, name: str, current: ToolEntry, previous: Optional[ToolEntry], *,
         scope: Optional[str] = None) -> bool:
         """Restore a host-owned registration if it is still current (plugin ownership ledger).
-        The identity check is deliberate: another plugin (or ``PluginManager`` in a
+        The identity check is deliberate: another plugin (or PluginManager in a
         multi-profile process) may have registered a newer entry under the same name, and
         unloading this entry must leave that newer one untouched."""
+        scope = normalize_scope(scope)
         with self._lock:
-            target = self._slot(scope, create=True)
+            session_scope = _registry_session_slot(scope, for_write=True)
+            session_target = self._slot(scope, include_session=True)
+            if session_scope is not None and session_target.get(name) is current:
+                target = session_target
+            else:
+                session_scope = None
+                target = self._slot(scope, create=True)
             if target.get(name) is not current:
                 return False
             if previous is None:
                 target.pop(name, None)
             else:
                 target[name] = previous
-            if scope is not None and not target:
+            if session_scope is not None:
+                if not target:
+                    self._session_scoped_tools.pop(session_scope, None)
+            elif scope is not None and not target:
                 self._scoped_tools.pop(scope, None)
 
             # Rebuild affected toolset checks from survivors: a plugin may have replaced an
@@ -824,15 +912,16 @@ class ToolRegistry:
             if previous is not None:
                 affected_toolsets.add(previous.toolset)
             for toolset in affected_toolsets:
-                surviving = self._toolset_entries(toolset, scope)
+                surviving = self._toolset_entries(
+                    toolset, scope, include_session=session_scope is not None,
+                )
                 check_fn = next((entry.check_fn for entry in surviving if entry.check_fn), None)
-                if scope is None:
+                if scope is None and session_scope is None:
                     if check_fn is None:
                         self._toolset_checks.pop(toolset, None)
                     else:
                         self._toolset_checks[toolset] = check_fn
-                in_overlays = (e for m in self._scoped_tools.values() for e in m.values())
-                if not surviving and not any(e.toolset == toolset for e in in_overlays):
+                if not self._toolset_exists_anywhere(toolset):
                     self._drop_toolset_aliases(toolset)
             self._generation += 1
         logger.debug("Restored tool registration: %s", name)

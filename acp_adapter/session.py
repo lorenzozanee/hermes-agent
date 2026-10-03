@@ -151,6 +151,8 @@ class SessionState:
     # Per-session allocator for ACP assistant messageIds (lazily created by
     # the server so streamed chunks group into distinct assistant replies).
     message_ids: Any = None
+    mcp_server_names: set[str] = field(default_factory=set)
+    mcp_server_fingerprints: Dict[str, str] = field(default_factory=dict)
 
 
 class SessionManager:
@@ -563,7 +565,10 @@ class SessionManager:
         try:
             from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-            ensure_mcp_discovery_before_agent_build(logger=logger, thread_name="acp-mcp-discovery")
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger, thread_name="acp-mcp-discovery",
+                exclude_session_relative_stdio=True,
+            )
         except Exception:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 

@@ -19,9 +19,11 @@ from hermes_cli import mcp_startup
 def _reset_mcp_startup_state():
     saved_started = mcp_startup._mcp_discovery_started
     saved_thread = mcp_startup._mcp_discovery_thread
+    saved_exclusions = mcp_startup._mcp_discovery_excludes_session_stdio
     try:
         mcp_startup._mcp_discovery_started = set()
         mcp_startup._mcp_discovery_thread = {}
+        mcp_startup._mcp_discovery_excludes_session_stdio = {}
         yield
     finally:
         thread = mcp_startup._current_home_thread()
@@ -29,6 +31,7 @@ def _reset_mcp_startup_state():
             thread.join(timeout=1.0)
         mcp_startup._mcp_discovery_started = saved_started
         mcp_startup._mcp_discovery_thread = saved_thread
+        mcp_startup._mcp_discovery_excludes_session_stdio = saved_exclusions
 
 
 def _agent_args(**overrides) -> Namespace:
@@ -427,6 +430,89 @@ def test_background_discovery_honors_server_filter(monkeypatch, _reset_mcp_serve
     mcp_startup.set_mcp_server_filter("terminal,code-mcp")
     mcp_startup._discover_mcp_tools_without_interactive_oauth()
     assert calls == [["terminal", "code-mcp"]]
+
+def test_acp_background_discovery_excludes_session_relative_stdio(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mcp_startup, "_has_configured_mcp_servers", lambda: True)
+    monkeypatch.setattr(mcp_startup, "_any_mcp_connected", lambda: False)
+    monkeypatch.setattr(
+        mcp_startup, "_discover_mcp_tools_without_interactive_oauth",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    logger = types.SimpleNamespace(
+        debug=lambda *_a, **_k: None, warning=lambda *_a, **_k: None,
+        info=lambda *_a, **_k: None,
+    )
+
+    mcp_startup.start_background_mcp_discovery(
+        logger=logger, thread_name="acp-test", exclude_session_relative_stdio=True,
+    )
+    thread = mcp_startup._current_home_thread()
+    if thread is not None:
+        thread.join(timeout=5.0)
+
+    assert calls == [{"exclude_session_relative_stdio": True}]
+
+
+def test_acp_discovery_retry_keeps_session_stdio_excluded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mcp_startup, "_has_configured_mcp_servers", lambda: True)
+    monkeypatch.setattr(mcp_startup, "_any_mcp_connected", lambda: False)
+    monkeypatch.setattr(
+        mcp_startup, "_discover_mcp_tools_without_interactive_oauth",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    logger = types.SimpleNamespace(
+        debug=lambda *_a, **_k: None, warning=lambda *_a, **_k: None,
+        info=lambda *_a, **_k: None,
+    )
+
+    for _ in range(2):
+        mcp_startup.start_background_mcp_discovery(
+            logger=logger, thread_name="acp-retry-test", exclude_session_relative_stdio=True,
+        )
+        thread = mcp_startup._current_home_thread()
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    assert calls == [
+        {"exclude_session_relative_stdio": True},
+        {"exclude_session_relative_stdio": True},
+    ]
+
+def test_discovery_helper_passes_session_stdio_filter(monkeypatch, _reset_mcp_server_filter):
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool_discovery",
+        types.SimpleNamespace(discover_mcp_tools=lambda **kwargs: calls.append(kwargs)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_oauth",
+        types.SimpleNamespace(suppress_interactive_oauth=nullcontext),
+    )
+
+    mcp_startup._discover_mcp_tools_without_interactive_oauth(
+        exclude_session_relative_stdio=True,
+    )
+
+    assert calls == [{"exclude_session_relative_stdio": True}]
+
+
+def test_acp_pending_servers_use_same_session_stdio_filter(monkeypatch):
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool_discovery",
+        types.SimpleNamespace(
+            mcp_servers_awaiting_connect=lambda **kwargs: calls.append(kwargs) or ["fixed"]
+        ),
+    )
+    mcp_startup._mcp_discovery_excludes_session_stdio[mcp_startup.hermes_home_key()] = True
+
+    assert mcp_startup._servers_awaiting_connect() == ["fixed"]
+    assert calls == [{"exclude_session_relative_stdio": True}]
 
 
 def test_prepare_agent_startup_installs_server_filter(monkeypatch, _reset_mcp_server_filter):

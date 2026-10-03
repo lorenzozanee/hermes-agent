@@ -211,7 +211,9 @@ def main(argv: list[str] | None = None) -> None:
         try:
             from hermes_cli.mcp_startup import start_background_mcp_discovery
 
-            start_background_mcp_discovery(logger=logger, thread_name="acp-mcp-discovery")
+            start_background_mcp_discovery(
+                logger=logger, thread_name="acp-mcp-discovery", exclude_session_relative_stdio=True,
+            )
         except Exception:
             logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
 

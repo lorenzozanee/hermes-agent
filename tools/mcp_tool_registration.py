@@ -6,6 +6,7 @@ live, ``_register_from_cache_sync`` lazy) build ``_Candidate`` records for ``_re
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from tools.mcp_tool_handlers import (
     _make_list_resources_handler, _make_read_resource_handler)
 from tools.mcp_tool_schema import (
     _UTILITY_CAPABILITY_ATTRS, _build_utility_schemas, _normalize_name_filter, matches_name_filter)
-from tools.mcp_tool_scope import _key_name, _key_scope, _resolve_server_key, _server_key
+from tools.mcp_tool_scope import _key_name, _key_scope, _key_session, _resolve_server_key, _server_key
 
 if TYPE_CHECKING:  # pragma: no cover
     from tools.mcp_tool import MCPServerTask
@@ -80,9 +81,23 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
         _core._mcp_tool_server_names[tool_name] = server_name
 
 
-def _forget_mcp_tool_server(tool_name: str) -> None:
+def _forget_mcp_tool_server(tool_name: str, *, connection_key=None) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _core._lock:
+        if connection_key is not None and any(
+            key != connection_key
+            and _key_name(key) == _key_name(connection_key)
+            and tool_name in (getattr(server, "_registered_tool_names", ()) or ())
+            for key, server in _core._servers.items()
+        ):
+            return
+        if connection_key is not None and any(
+            key != connection_key
+            and _key_name(key) == _key_name(connection_key)
+            and tool_name in tool_names
+            for key, tool_names in _core._lazy_server_tool_names.items()
+        ):
+            return
         _core._mcp_tool_server_names.pop(tool_name, None)
 
 
@@ -96,9 +111,23 @@ def _server_key_for_task(server) -> object:
     return _server_key(server.name)
 
 
+@contextmanager
+def _registry_context_for_key(key, scope):
+    session_id = _key_session(key)
+    if session_id is None:
+        yield
+        return
+    from tools.registry import reset_registry_session_scope, set_registry_session_scope
+
+    token = set_registry_session_scope(scope, session_id)
+    try:
+        yield
+    finally:
+        reset_registry_session_scope(token)
+
+
 def _deregister_mcp_tool_all_scopes(server, tool_name: str) -> None:
-    """Deregister one server tool from every profile overlay that owns it. *server* is the
-    live task or a connection key."""
+    """Deregister one server tool from every registry overlay that owns it."""
     from tools.registry import registry
 
     key = server if isinstance(server, (str, tuple)) else _server_key_for_task(server)
@@ -107,9 +136,11 @@ def _deregister_mcp_tool_all_scopes(server, tool_name: str) -> None:
         if not scopes:
             scopes = {_core._server_registry_scope(key)}
     for scope in scopes:
-        registry.deregister(tool_name, scope=scope)
-    _forget_mcp_tool_server(tool_name)
-    _restore_server_toolset_alias(key)
+        with _registry_context_for_key(key, scope):
+            registry.deregister(tool_name, scope=scope)
+    with _registry_context_for_key(key, _core._server_registry_scope(key)):
+        _forget_mcp_tool_server(tool_name, connection_key=key)
+        _restore_server_toolset_alias(key)
 
 
 def _restore_server_toolset_alias(key) -> None:
@@ -130,22 +161,23 @@ def _restore_server_toolset_alias(key) -> None:
         registry.register_toolset_alias(server_name, f"mcp-{server_name}")
 
 
-def _remove_server_scope(key, scope: str) -> None:
-    """Remove one profile's MCP overlay for a shared live connection."""
+def _remove_server_scope(key, scope: Optional[str]) -> None:
+    """Remove one profile/session overlay for a live connection."""
     from tools.registry import registry
 
     server_name = _key_name(key)
-    for tool_name in registry.get_tool_names_for_toolset(f"mcp-{server_name}"):
-        registry.deregister(tool_name, scope=scope)
-    with _core._lock:
-        scopes = set(_core._server_tool_scopes.get(key, ()))
-        scopes.discard(scope)
-        if scopes:
-            _core._server_tool_scopes[key] = scopes
-        else:
-            _core._server_tool_scopes.pop(key, None)
-        _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
-    _restore_server_toolset_alias(key)
+    with _registry_context_for_key(key, scope):
+        for tool_name in registry.get_tool_names_for_toolset(f"mcp-{server_name}"):
+            registry.deregister(tool_name, scope=scope)
+        with _core._lock:
+            scopes = set(_core._server_tool_scopes.get(key, ()))
+            scopes.discard(scope)
+            if scopes:
+                _core._server_tool_scopes[key] = scopes
+            else:
+                _core._server_tool_scopes.pop(key, None)
+            _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
+        _restore_server_toolset_alias(key)
 
 
 def _select_utility_schemas(server_name: str, server: "MCPServerTask", config: dict) -> List[dict]:
@@ -465,8 +497,8 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
     tokens live in the owner's token store (never reusable), and secret-source env, the profile
     identity header and the default cwd resolve per profile, so the adopter's resolution
     (*resolved_identity*, computed by the caller outside the registry lock; None refuses) must hash
-    to what the owner connected with. Within one profile the connection is the profile's: its
-    default cwd resolves in the connection task's own context, never per session."""
+    to what the owner connected with. ACP session-scoped names use their session key and never
+    adopt a different session's connection."""
     if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
         return False
     if not cross_profile:
@@ -480,7 +512,9 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
 def register_connected_into_current_scope(servers: dict) -> int:
     """Serialize shared-scope reconciliation and registration for one discovery pass."""
     scope = _core._mcp_registry_scope()
-    if scope is None:
+    from tools.mcp_tool_scope import session_scope_active
+
+    if scope is None or session_scope_active():
         return 0
     with _SCOPE_REFRESH_LOCKS[hash(scope) % len(_SCOPE_REFRESH_LOCKS)]:
         return _register_connected_into_current_scope(servers)

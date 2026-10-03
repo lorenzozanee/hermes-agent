@@ -256,12 +256,7 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], skip_tool_search_assembly: bool,
 ) -> Optional[tuple]:
-    """Memo key for get_tool_definitions, or None when caching must be bypassed.
-
-    Covers every argument plus everything that changes the result without one:
-    registry generation, config.yaml stat signature (dynamic schemas), kanban
-    context, profile scope. check_fn results are TTL-cached in the registry.
-    """
+    """Memo key for get_tool_definitions, or None when caching must be bypassed."""
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
         return None
@@ -271,8 +266,11 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    from tools.registry import registry_session_scope_key
+
     return (
-        registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+        registry.current_scope_key(), registry_session_scope_key(),
+        frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,

@@ -463,6 +463,53 @@ class TestContextVarInterpolation:
         assert out["env"]["CACHE"] == f"{home}{os.sep}.cache"
         assert out["headers"]["X-Ws"] == "app"
 
+    def test_workspace_folder_override_is_used_for_nested_config(self, tmp_path):
+        config = {
+            "args": ["${workspaceFolder}", "${workspaceFolderBasename}"],
+            "cwd": "${workspaceFolder}/cache",
+        }
+        result = _mcp_config._interpolate_env_vars(config, workspace_folder=str(tmp_path / "repo"))
+        assert result == {
+            "args": [str(tmp_path / "repo"), "repo"],
+            "cwd": str(tmp_path / "repo" / "cache"),
+        }
+
+    def test_config_loading_separates_session_relative_stdio(self, monkeypatch, tmp_path):
+        raw = {
+            "implicit": {"command": "server", "args": ["${workspaceFolder}"]},
+            "templated": {
+                "command": "server", "cwd": "${workspaceFolder}/cache",
+                "args": ["${workspaceFolderBasename}"],
+            },
+            "explicit": {"command": "server", "cwd": "/shared", "args": []},
+            "remote": {"url": "https://mcp.example"},
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"mcp_servers": raw})
+        monkeypatch.setattr("utils.env_var_enabled", lambda _name: False)
+        monkeypatch.setattr(_mcp_config, "_filter_suspicious_mcp_servers", lambda servers: servers)
+
+        def add_portable_servers(servers):
+            servers.update({
+                "portable-implicit": {"command": "portable", "args": []},
+                "portable-fixed": {"command": "portable", "cwd": "/portable"},
+                "portable-http": {"url": "https://portable.example/mcp"},
+            })
+
+        monkeypatch.setattr(_mcp_config, "_portable_mcp_servers", add_portable_servers)
+        monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", lambda: None)
+        monkeypatch.setattr(_mcp_config, "_workspace_folder", lambda: "/process/default")
+
+        session_servers = _mcp_config._load_mcp_config(
+            workspace_folder=str(tmp_path / "session"), session_relative_stdio_only=True,
+        )
+        assert set(session_servers) == {"implicit", "templated", "portable-implicit"}
+        assert session_servers["implicit"]["args"] == [str(tmp_path / "session")]
+        assert session_servers["templated"]["cwd"] == str(tmp_path / "session" / "cache")
+        assert session_servers["templated"]["args"] == ["session"]
+
+        profile_servers = _mcp_config._load_mcp_config(exclude_session_relative_stdio=True)
+        assert set(profile_servers) == {"explicit", "remote", "portable-fixed", "portable-http"}
+
 
 # ---------------------------------------------------------------------------
 # Tests: probe-path env resolution (#37792)

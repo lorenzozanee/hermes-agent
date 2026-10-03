@@ -17,6 +17,7 @@ _mcp_discovery_lock = threading.Lock()
 # A single-profile process has exactly one key, so behaviour is the old single-slot form.
 _mcp_discovery_started: Set[str] = set()
 _mcp_discovery_thread: Dict[str, threading.Thread] = {}
+_mcp_discovery_excludes_session_stdio: Dict[str, bool] = {}
 _mcp_discovery_deferred: Optional[threading.Timer] = None
 # Process-wide MCP server-name allowlist derived from ``-t/--toolsets``.
 # ``None`` = no filter (spawn every configured server). Set once at CLI
@@ -86,11 +87,14 @@ def _any_mcp_connected() -> bool:
 def _servers_awaiting_connect() -> list[str]:
     from tools.mcp_tool_discovery import mcp_servers_awaiting_connect
 
-    pending = mcp_servers_awaiting_connect()
+    exclude_session_stdio = _mcp_discovery_excludes_session_stdio.get(hermes_home_key(), False)
+    pending = mcp_servers_awaiting_connect(exclude_session_relative_stdio=exclude_session_stdio)
     return pending if _mcp_server_filter is None else [n for n in pending if n in _mcp_server_filter]
 
 
-def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
+def start_background_mcp_discovery(
+    *, logger, thread_name: str, exclude_session_relative_stdio: bool = False
+) -> None:
     """Spawn one background MCP discovery thread per profile home.
 
     If the first run exits without connecting any server (e.g. startup cancellation / OOM restart),
@@ -123,6 +127,7 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             _mcp_discovery_thread.pop(home_key, None)
 
         _mcp_discovery_started.add(home_key)
+        _mcp_discovery_excludes_session_stdio[home_key] = exclude_session_relative_stdio
         if not _has_configured_mcp_servers():
             return
 
@@ -134,7 +139,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         # The config gate above already runs on the caller's thread, so it sees the same context.
         def _discover() -> None:
             try:
-                _discover_mcp_tools_without_interactive_oauth()
+                if exclude_session_relative_stdio:
+                    _discover_mcp_tools_without_interactive_oauth(exclude_session_relative_stdio=True)
+                else:
+                    _discover_mcp_tools_without_interactive_oauth()
                 try:
                     if not _any_mcp_connected():
                         logger.warning("Background MCP discovery completed with zero connected servers")
@@ -195,7 +203,7 @@ def _discovery_gil_budget() -> Iterator[None]:
         sys.setswitchinterval(prev)
 
 
-def _discover_mcp_tools_without_interactive_oauth() -> None:
+def _discover_mcp_tools_without_interactive_oauth(*, exclude_session_relative_stdio: bool = False) -> None:
     """Run MCP discovery without letting OAuth read from the user's stdin."""
     try:
         from tools.mcp_oauth import suppress_interactive_oauth
@@ -208,8 +216,16 @@ def _discover_mcp_tools_without_interactive_oauth() -> None:
         # Only pass the kwarg when a filter is set: many tests (and any
         # out-of-tree caller) stub discover_mcp_tools with a zero-arg
         # callable, and the unfiltered call shape is unchanged.
-        if _mcp_server_filter is None:
+        if _mcp_server_filter is None and not exclude_session_relative_stdio:
             discover_mcp_tools()
+        elif exclude_session_relative_stdio:
+            if _mcp_server_filter is None:
+                discover_mcp_tools(exclude_session_relative_stdio=True)
+            else:
+                discover_mcp_tools(
+                    allowed_mcp_names=_mcp_server_filter,
+                    exclude_session_relative_stdio=True,
+                )
         else:
             discover_mcp_tools(allowed_mcp_names=_mcp_server_filter)
 
@@ -305,7 +321,8 @@ def ensure_mcp_discovery_before_agent_build(
     logger,
     timeout: "float | None" = None,
     single_query: bool = False,
-    thread_name: str = "cli-mcp-discovery") -> None:
+    thread_name: str = "cli-mcp-discovery",
+    exclude_session_relative_stdio: bool = False) -> None:
     """Give configured MCP tools a bounded chance to register before AIAgent.
 
     Non-interactive first turns (``chat -q``, ``hermes -z``) can construct ``AIAgent`` before any
@@ -313,7 +330,10 @@ def ensure_mcp_discovery_before_agent_build(
     start discovery if needed, then wait up to the configured bound.
     """
     try:
-        start_background_mcp_discovery(logger=logger, thread_name=thread_name)
+        start_background_mcp_discovery(
+            logger=logger, thread_name=thread_name,
+            exclude_session_relative_stdio=exclude_session_relative_stdio,
+        )
         wait_for_mcp_discovery(timeout=timeout, single_query=single_query)
     except Exception:
         logger.debug("MCP discovery readiness check failed before agent build", exc_info=True)

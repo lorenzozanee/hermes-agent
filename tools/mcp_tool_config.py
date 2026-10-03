@@ -345,20 +345,29 @@ def _npx_cached_bin(args: list) -> Optional[tuple]:
     return None
 
 
-def _interpolate_env_vars(value):
-    """Recursively resolve ``${VAR}`` / Cursor ``${env:VAR}`` placeholders and context vars. Env
-    refs resolve from the active profile's secret scope when multiplexing (the routed profile's
-    value, not another profile's in ``os.environ``). Unset vars keep the literal placeholder."""
+def _interpolate_env_vars(value, *, workspace_folder: Optional[str] = None):
+    """Recursively resolve env and Cursor context placeholders."""
     from agent.secret_scope import get_secret as _get_secret
+
+    folder = os.path.abspath(workspace_folder) if workspace_folder else None
+
     if isinstance(value, str):
-        def _replace(m):
-            resolver = _CONTEXT_VAR_RESOLVERS.get(m.group(1).strip())
-            return resolver() if resolver is not None else (_get_secret(_env_ref_name(m.group(1)), m.group(0)) or m.group(0))
+        def _replace(match):
+            name = match.group(1).strip()
+            if folder is not None and name == "workspaceFolder":
+                return folder
+            if folder is not None and name == "workspaceFolderBasename":
+                return os.path.basename(folder.rstrip("/\\")) or folder
+            resolver = _CONTEXT_VAR_RESOLVERS.get(name)
+            return resolver() if resolver is not None else (
+                _get_secret(_env_ref_name(name), match.group(0)) or match.group(0)
+            )
+
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+        return {key: _interpolate_env_vars(item, workspace_folder=folder) for key, item in value.items()}
     if isinstance(value, list):
-        return [_interpolate_env_vars(v) for v in value]
+        return [_interpolate_env_vars(item, workspace_folder=folder) for item in value]
     return value
 
 
@@ -438,27 +447,54 @@ def _portable_mcp_servers(safe_servers: Dict[str, dict]) -> None:
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
-def _load_mcp_config() -> Dict[str, dict]:
-    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
+def _load_mcp_config(
+    *, workspace_folder: Optional[str] = None, session_relative_stdio_only: bool = False,
+    exclude_session_relative_stdio: bool = False, raise_on_error: bool = False,
+) -> Dict[str, dict]:
+    """Load filtered MCP config, optionally scoped to session-relative stdio entries."""
     try:
         from hermes_cli.config import load_config
         from utils import env_var_enabled as _env_enabled
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
         servers = load_config().get("mcp_servers")
-        try:  # ensure .env vars are available for interpolation
+        try:
             from hermes_cli.env_loader import load_hermes_dotenv
             load_hermes_dotenv()
         except Exception:
             pass
+        merged_servers = _filter_suspicious_mcp_servers(servers if isinstance(servers, dict) else {})
+        _portable_mcp_servers(merged_servers)
+
+        def _contains_workspace_ref(value: Any) -> bool:
+            if isinstance(value, str):
+                return any(
+                    match.group(1).strip() in {"workspaceFolder", "workspaceFolderBasename"}
+                    for match in _ENV_VAR_PATTERN.finditer(value)
+                )
+            if isinstance(value, dict):
+                return any(_contains_workspace_ref(item) for item in value.values())
+            if isinstance(value, list):
+                return any(_contains_workspace_ref(item) for item in value)
+            return False
+
         safe_servers: Dict[str, dict] = {}
-        for name, cfg in _filter_suspicious_mcp_servers(servers if isinstance(servers, dict) else {}).items():
-            interpolated = _interpolate_env_vars(cfg)
+        for name, cfg in merged_servers.items():
+            session_relative = (
+                isinstance(cfg, dict) and "command" in cfg
+                and (cfg.get("cwd") is None or _contains_workspace_ref(cfg))
+            )
+            if session_relative_stdio_only and not session_relative:
+                continue
+            if exclude_session_relative_stdio and session_relative:
+                continue
+            interpolated = _interpolate_env_vars(cfg, workspace_folder=workspace_folder)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
-        _portable_mcp_servers(safe_servers)
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
+        if raise_on_error:
+            raise
         return {}

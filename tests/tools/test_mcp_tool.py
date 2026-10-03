@@ -1333,6 +1333,40 @@ class TestGracefulFallback:
 
 class TestShutdown:
 
+    def test_session_shutdown_timeout_propagates_and_retains_live_state(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import MCPServerTask
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+        server = MCPServerTask("session-server")
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_scope_keys.clear()
+            mcp_mod._server_tool_scopes.clear()
+            session_key = ((None, "session-a", "/workspace", "fingerprint"), "session-server")
+            mcp_mod._servers[session_key] = server
+            mcp_mod._server_scope_keys[session_key] = None
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        failed = MagicMock()
+        failed.result.side_effect = TimeoutError("shutdown timed out")
+        try:
+            with patch.object(mcp_mod, "_mcp_loop", loop), \
+                 patch("agent.async_utils.safe_schedule_threadsafe", return_value=failed), \
+                 patch("tools.mcp_tool_loop._stop_mcp_loop") as stop_loop, \
+                 pytest.raises(RuntimeError, match="connection state was retained"):
+                shutdown_mcp_servers(scope=None, session_id="session-a", timeout=0.01)
+
+            assert mcp_mod._servers[session_key] is server
+            assert mcp_mod._server_scope_keys[session_key] is None
+            stop_loop.assert_not_called()
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_scope_keys.clear()
+                mcp_mod._server_tool_scopes.clear()
+
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.
 
@@ -1398,7 +1432,7 @@ class TestShutdown:
             with patch(
                 "agent.async_utils.safe_schedule_threadsafe",
                 side_effect=schedule_then_report_timeout,
-            ):
+            ), pytest.raises(RuntimeError, match="live connection state was retained"):
                 shutdown_mcp_servers()
 
             assert loop.is_closed()

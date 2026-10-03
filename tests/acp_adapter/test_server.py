@@ -617,9 +617,21 @@ class TestSlashCommands:
         state.agent.model = "test-model"
         state.agent.provider = "openrouter"
 
+        from tools.mcp_tool_scope import _server_key, session_scope_active
+
+        observed = {}
+        agent._cmd_help = lambda _args, _state: observed.update(
+            active=session_scope_active(),
+            key=_server_key("session-server"),
+        ) or "ok"
+        state.mcp_server_fingerprints = {"session-server": "fingerprint"}
         before = str(resolve_agent_cwd())
-        agent._handle_slash_command("/help", state)
+        assert agent._handle_slash_command("/help", state) == "ok"
         assert str(resolve_agent_cwd()) == before
+        assert observed == {
+            "active": True,
+            "key": ((None, state.session_id, str(workspace), "fingerprint"), "session-server"),
+        }
 
 
 
@@ -641,7 +653,7 @@ class TestRegisterSessionMcpServers:
 
         state = mock_manager.create_session(cwd="/tmp")
         # Give the mock agent the attributes _register_session_mcp_servers reads
-        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-configured"]
         state.agent.disabled_toolsets = None
         state.agent.tools = []
         state.agent.valid_tool_names = set()
@@ -661,7 +673,8 @@ class TestRegisterSessionMcpServers:
             pinned_cwd["value"] = resolve_context_cwd()  # the stdio default cwd reads this pin
             return ["mcp_test_server_tool1"]
 
-        with patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=capture_register), \
+        with patch("tools.mcp_tool_config._load_mcp_config", side_effect=lambda **_kwargs: {}), \
+             patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=capture_register), \
              patch("model_tools.get_tool_definitions", return_value=[]):
             await agent._register_session_mcp_servers(state, [server])
 
@@ -672,6 +685,178 @@ class TestRegisterSessionMcpServers:
         assert cfg["env"] == {"KEY": "val"}
         # Registration runs under the session's logical cwd so IDE-provided stdio servers spawn there.
         assert pinned_cwd["value"] == Path("/tmp")
+
+    @pytest.mark.asyncio
+    async def test_stdio_config_server_uses_each_acp_session_cwd(self, agent, mock_manager, tmp_path):
+        """A real stdio server remains bound to its ACP session across interleaved calls."""
+        import json
+        import sys
+
+        from tools.mcp_tool_scope import reset_session_scope, set_session_scope
+        from tools.registry import registry
+
+        server_script = tmp_path / "cwd_server.py"
+        server_script.write_text(
+            "\n".join([
+                "import asyncio",
+                "import os",
+                "from mcp.server.lowlevel import Server",
+                "from mcp.server.stdio import stdio_server",
+                "from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool",
+                "",
+                "async def list_tools(_ctx, _params):",
+                "    return ListToolsResult(tools=[Tool(name='get_cwd', inputSchema={'type': 'object', 'properties': {}})])",
+                "",
+                "async def call_tool(_ctx, _params):",
+                "    return CallToolResult(content=[TextContent(type='text', text=os.getcwd())])",
+                "",
+                "server = Server('cwd-server', on_list_tools=list_tools, on_call_tool=call_tool)",
+                "",
+                "async def main():",
+                "    async with stdio_server() as (read_stream, write_stream):",
+                "        await server.run(read_stream, write_stream, server.create_initialization_options())",
+                "",
+                "asyncio.run(main())",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        workspaces = [tmp_path / "workspace-a", tmp_path / "workspace-b"]
+        for workspace in workspaces:
+            workspace.mkdir()
+        states = [mock_manager.create_session(cwd=str(workspace)) for workspace in workspaces]
+        for state in states:
+            state.agent.enabled_toolsets = ["hermes-acp", "mcp-cwd-server"]
+            state.agent.disabled_toolsets = None
+            state.agent.tools = []
+            state.agent.valid_tool_names = set()
+            state.agent._memory_manager = None
+
+        config = {"cwd-server": {"command": sys.executable, "args": [str(server_script)]}}
+        try:
+            with patch("tools.mcp_tool_config._load_mcp_config", return_value=config):
+                for state in states:
+                    await agent._register_session_mcp_servers(state, None)
+
+            observed = []
+            for state in (states[0], states[1], states[0]):
+                token = set_session_scope(state.session_id, state.cwd, state.mcp_server_fingerprints)
+                try:
+                    result = registry.dispatch("mcp__cwd_server__get_cwd", {})
+                finally:
+                    reset_session_scope(token)
+                observed.append(json.loads(result)["result"])
+
+            assert observed == [str(workspaces[0]), str(workspaces[1]), str(workspaces[0])]
+        finally:
+            from tools.mcp_tool_common import _core
+            from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+            for state in states:
+                token = set_session_scope(state.session_id, state.cwd, state.mcp_server_fingerprints)
+                try:
+                    shutdown_mcp_servers(
+                        scope=_core._mcp_registry_scope(), session_id=state.session_id, timeout=5.0,
+                    )
+                finally:
+                    reset_session_scope(token)
+
+    @pytest.mark.asyncio
+    async def test_registers_default_cwd_config_stdio_server_per_session(self, agent, mock_manager, tmp_path):
+        state = mock_manager.create_session(cwd=str(tmp_path))
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-configured"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+
+        registered = {}
+
+        def capture_register(configs):
+            from agent.runtime_cwd import resolve_context_cwd
+            from tools.mcp_tool_scope import _server_key
+
+            registered["configs"] = configs
+            registered["cwd"] = resolve_context_cwd()
+            registered["key"] = _server_key("configured")
+
+        config = {"configured": {"command": "/usr/bin/test", "args": []}}
+        with patch("tools.mcp_tool_config._load_mcp_config", side_effect=lambda **_kwargs: config) as mock_config, \
+             patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=capture_register), \
+             patch("model_tools.get_tool_definitions", return_value=[]):
+            await agent._register_session_mcp_servers(state, None)
+
+        mock_config.assert_called_once_with(
+            workspace_folder=str(tmp_path), session_relative_stdio_only=True, raise_on_error=True,
+        )
+        assert registered["configs"] == config
+        assert registered["cwd"] == tmp_path
+        assert registered["key"] == (
+            (None, state.session_id, str(tmp_path), state.mcp_server_fingerprints["configured"]), "configured",
+        )
+        assert state.mcp_server_names == {"configured"}
+
+    @pytest.mark.asyncio
+    async def test_session_attachment_respects_configured_mcp_toolsets(self, agent, mock_manager, tmp_path):
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd=str(tmp_path))
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-allowed"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        configured = {
+            "allowed": {"command": "/usr/bin/allowed", "args": []},
+            "blocked": {"command": "/usr/bin/blocked", "args": []},
+        }
+        explicit = McpServerStdio(name="client-server", command="/usr/bin/client", args=[], env=[])
+        registered = {}
+
+        with patch("tools.mcp_tool_config._load_mcp_config", return_value=configured), \
+             patch("tools.mcp_tool_lifecycle.shutdown_mcp_servers"), \
+             patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=lambda cfg: registered.update(cfg)), \
+             patch("model_tools.get_tool_definitions", return_value=[]):
+            await agent._register_session_mcp_servers(state, [explicit])
+
+        assert set(registered) == {"allowed", "client-server"}
+        assert state.mcp_server_names == {"allowed", "client-server"}
+        assert "blocked" not in state.mcp_server_names
+
+    @pytest.mark.asyncio
+    async def test_reattach_replaces_old_session_toolsets_and_reaps_stale_connections(
+        self, agent, mock_manager, tmp_path
+    ):
+        state = mock_manager.create_session(cwd=str(tmp_path))
+        state.mcp_server_names = {"old"}
+        state.mcp_server_fingerprints = {"old": "old-fingerprint"}
+        state.agent.enabled_toolsets = ["hermes-acp", "mcp-old", "mcp-new"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+
+        current = {"new": {"command": "/usr/bin/test", "args": []}}
+        with patch("tools.mcp_tool_config._load_mcp_config", side_effect=lambda **_kwargs: current), \
+             patch("tools.mcp_tool_lifecycle.shutdown_mcp_servers") as mock_shutdown, \
+             patch("tools.mcp_tool_discovery.register_mcp_servers") as mock_register, \
+             patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+            await agent._register_session_mcp_servers(state, None)
+
+        assert state.mcp_server_names == {"new"}
+        assert set(state.mcp_server_fingerprints) == {"new"}
+        mock_shutdown.assert_called_once_with(
+            scope=None, session_id=state.session_id, stale_session=True, timeout=5.0,
+        )
+        mock_register.assert_called_once_with(current)
+        assert mock_defs.call_args.kwargs["enabled_toolsets"] == ["hermes-acp", "mcp-new"]
+
+    @pytest.mark.asyncio
+    async def test_config_load_failure_propagates(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        with patch(
+            "tools.mcp_tool_config._load_mcp_config",
+            side_effect=RuntimeError("config read failed"),
+        ):
+            with pytest.raises(RuntimeError, match="config read failed"):
+                await agent._register_session_mcp_servers(state, None)
 
 
     @pytest.mark.asyncio
@@ -704,7 +889,8 @@ class TestRegisterSessionMcpServers:
             {"function": {"name": "terminal"}},
         ]
 
-        with patch("tools.mcp_tool_discovery.register_mcp_servers", return_value=["mcp_srv_search"]), \
+        with patch("tools.mcp_tool_config._load_mcp_config", side_effect=lambda **_kwargs: {}), \
+             patch("tools.mcp_tool_discovery.register_mcp_servers", return_value=["mcp_srv_search"]), \
              patch("model_tools.get_tool_definitions", return_value=fake_tools) as mock_defs:
             await agent._register_session_mcp_servers(state, [server])
 
@@ -733,8 +919,8 @@ class TestRegisterSessionMcpServers:
         state.agent._invalidate_system_prompt.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_register_failure_logs_warning(self, agent, mock_manager):
-        """If register_mcp_servers raises, warning is logged but no crash."""
+    async def test_register_failure_propagates(self, agent, mock_manager):
+        """Unexpected MCP registration errors fail session attachment."""
         from acp.schema import McpServerStdio
 
         state = mock_manager.create_session(cwd="/tmp")
@@ -745,9 +931,10 @@ class TestRegisterSessionMcpServers:
             env=[],
         )
 
-        with patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=RuntimeError("boom")):
-            # Should not raise
-            await agent._register_session_mcp_servers(state, [server])
+        with patch("tools.mcp_tool_config._load_mcp_config", side_effect=lambda **_kwargs: {}), \
+             patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                await agent._register_session_mcp_servers(state, [server])
 
 
 class TestDisabledToolsetsFilterToolSurface:

@@ -18,7 +18,9 @@ from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_loop as _loop
 from tools import mcp_tool_registration as _registration
 from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX
-from tools.mcp_tool_scope import _key_name, _key_scope, _key_visible_in_scope, _resolve_server_key, _server_key
+from tools.mcp_tool_scope import (
+    _key_matches_current_session, _key_name, _key_scope, _key_session, _key_visible_in_scope,
+    _resolve_server_key, _server_key)
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -576,7 +578,7 @@ def _acquire_discovery_lock_with_retry():
     return cookie
 
 
-def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[str]:
+def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None, *, exclude_session_relative_stdio: bool = False) -> List[str]:
     """Entry point: load config, connect servers, register tools. [] without the ``mcp``
     package; idempotent (only servers missing from a previous call are retried).
 
@@ -585,7 +587,10 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
     ``hermes -z -t <toolsets>`` to skip cold-starting servers the caller doesn't need (10-60s
     each); it only affects which servers start, not which names ``-t`` validation can see."""
     with _owner_secret_scope():
-        servers = _config._load_mcp_config()
+        if exclude_session_relative_stdio:
+            servers = _config._load_mcp_config(exclude_session_relative_stdio=True)
+        else:
+            servers = _config._load_mcp_config()
     if not servers:
         logger.debug("No MCP servers configured")
         return []
@@ -645,11 +650,12 @@ def reconcile_mcp_servers_with_config() -> Dict[str, List[str]]:
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:
-        owned = [key for key, owner in _core._server_scope_keys.items() if owner == scope]
+        owned = [key for key, owner in _core._server_scope_keys.items()
+                 if owner == scope and _key_session(key) is None]
         live = {_key_name(key) for key in owned if key in _core._servers}
         connecting = {_key_name(key) for key in owned if key in _core._server_connecting}
         lazy = {key for key in _core._lazy_server_configs
-                if _key_scope(key) == scope and _key_name(key) not in wanted}
+                if _key_scope(key) == scope and _key_session(key) is None and _key_name(key) not in wanted}
     stale = sorted(live - wanted)
     if stale:
         logger.info("MCP server(s) %s no longer in config (or disabled); disconnecting", ", ".join(stale))
@@ -679,13 +685,16 @@ def _awaiting_connect(wanted: Set[str], scope) -> List[str]:
     return sorted(name for name in wanted - known if not _connect_cooldown_active(name))
 
 
-def mcp_servers_awaiting_connect() -> List[str]:
+def mcp_servers_awaiting_connect(*, exclude_session_relative_stdio: bool = False) -> List[str]:
     """Enabled ``mcp_servers`` entries the current registry scope has no live, connecting or lazy
     registration for, whose connect cooldown has lapsed: added to config since the last discovery
     run, or one whose earlier connect failed. Read-only — what the next :func:`discover_mcp_tools`
     would connect."""
     with _owner_secret_scope():
-        servers = _config._load_mcp_config()
+        if exclude_session_relative_stdio:
+            servers = _config._load_mcp_config(exclude_session_relative_stdio=True)
+        else:
+            servers = _config._load_mcp_config()
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     return _awaiting_connect(wanted, _core._mcp_registry_scope())
 
@@ -734,14 +743,18 @@ def get_mcp_status(configured: Optional[Dict[str, dict]] = None, *, include_runt
             # servers from a status read scoped to a different profile.
             return include_runtime and _core._server_visible_in_scope(key, current_scope)
 
-        active_servers = {_key_name(k): s for k, s in _core._servers.items() if visible(k)}
-        connecting = {_key_name(k) for k in _core._server_connecting if visible(k)}
-        connect_errors = {_key_name(k): e for k, e in _core._server_connect_errors.items() if visible(k)}
+        active_servers = {_key_name(k): s for k, s in _core._servers.items()
+                          if visible(k) and _key_matches_current_session(k)}
+        connecting = {_key_name(k) for k in _core._server_connecting
+                      if visible(k) and _key_matches_current_session(k)}
+        connect_errors = {_key_name(k): e for k, e in _core._server_connect_errors.items()
+                          if visible(k) and _key_matches_current_session(k)}
         # A lazy registration is not a live connection: ``_server_visible_in_scope`` reads the
         # adoption/teardown maps a lazy server never populates, so use the registration-level
         # predicate ``_resolve_server_key`` already relies on for this state.
         lazy_tools = {_key_name(k): len(v) for k, v in _core._lazy_server_tool_names.items()
                       if include_runtime and _key_visible_in_scope(k, current_scope)
+                      and _key_matches_current_session(k)
                       and k in _core._lazy_server_configs}
 
     result: List[dict] = []
