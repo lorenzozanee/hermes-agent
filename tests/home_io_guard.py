@@ -49,6 +49,7 @@ def _contains(path: str, prefix: str) -> bool:
 class HomeIOGuard:
     def __init__(self, roots, installed_apps=lambda: ()):
         self.roots = roots
+        self.interpreter = _normcase(os.path.realpath(sys.executable))
         # The machine's installed desktop app (``packaged_gui_app_paths()`` before any test ran):
         # deleting, replacing or writing into it is refused. Reads stay allowed: several update
         # paths only probe it.
@@ -85,6 +86,8 @@ class HomeIOGuard:
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
+                return
+            if metadata and absolute == self.interpreter:
                 return
             # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
             # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
