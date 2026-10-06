@@ -166,7 +166,7 @@ def strip_nullable_unions(schema: Any, *, keep_nullable_hint: bool = True) -> An
                 if keep_nullable_hint:
                     replacement.setdefault("nullable", True)
                 _carry_union_meta(stripped, replacement, skip_default_on_ref=True)
-                return _rewrite(replacement, collapse)  # the survivor may itself be a union
+                return replacement
         return stripped
     return _rewrite(schema, collapse)
 
