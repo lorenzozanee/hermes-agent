@@ -256,13 +256,22 @@ def retry_invalid_response(
             compression_attempts=compression_attempts, result=result,
         )
 
+    error = getattr(response, "error", None)
+    error_code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+    native_web_search_failure = bool(
+        getattr(response, "native_web_search_failure", False)
+        and str(getattr(response, "status", "") or "").strip().lower() == "failed"
+        and error_code == "server_error"
+    )
+
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
         error_type="InvalidAPIResponse",
         error_message=", ".join(error_details) or "Invalid API response",
-        status_code=getattr(getattr(response, "error", None), "code", None),
-        retry_count=retry_count, max_retries=max_retries, retryable=True, reason="invalid_response",
+        status_code=None if native_web_search_failure else getattr(getattr(response, "error", None), "code", None),
+        retry_count=retry_count, max_retries=max_retries, retryable=not native_web_search_failure,
+        reason="server_error" if native_web_search_failure else "invalid_response",
     )
     # Retry status is buffered and only surfaced if every retry+fallback exhausts.
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
@@ -291,6 +300,24 @@ def retry_invalid_response(
         retry_count = 0
         compression_attempts = 0
         return _verdict("break")
+
+    if native_web_search_failure:
+        error_msg = (
+            "Codex failed while running its native web search. The same request is not being retried. "
+            "To use client-side search, set `web.search_backend` to a client provider such as `firecrawl`, "
+            "`keenable`, `tavily`, or `exa`, then retry the turn. Hermes has not changed your configuration."
+        )
+        agent._flush_status_buffer()
+        agent._emit_diagnostic_status(f"❌ {error_msg}")
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure({
+            "final_response": error_msg,
+            "messages": messages,
+            "completed": False,
+            "api_calls": api_call_count,
+            "error": error_msg,
+            "failed": True,
+        }, "server_error", False))
 
     error_msg, provider_name, _failure_hint = describe_invalid_response(
         agent, response, api_duration

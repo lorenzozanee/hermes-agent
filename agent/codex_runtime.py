@@ -856,6 +856,7 @@ class _CodexResponseAssembler:
     terminal_status: str = "completed"
     terminal_usage = terminal_response_id = terminal_incomplete_details = terminal_error = None
     terminal_service_tier = None  # the tier the backend SERVED (may differ from the one requested)
+    saw_native_web_search_call = False
     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
     saw_response_completed = False
 
@@ -878,6 +879,7 @@ class _CodexResponseAssembler:
     def _on_item_added(self, event: Any, event_type: str) -> None:
         item = _event_field(event, "item")
         item_type = _event_field(item, "type", "")
+        self.saw_native_web_search_call |= item_type == "web_search_call"
         self.active_message_phase = _message_phase(item) if item_type == "message" else None
         if self.active_message_phase == "commentary":
             self.commentary_text_deltas = []
@@ -967,6 +969,7 @@ class _CodexResponseAssembler:
         done_item = _event_field(event, "item")
         if done_item is None:
             return
+        self.saw_native_web_search_call |= _event_field(done_item, "type", "") == "web_search_call"
         self.output_items.append(done_item)
         # Reuse the announced position when known (fresh tail sequence for unannounced items); the .done
         # event's own output_index wins over the announced one.
@@ -1045,6 +1048,7 @@ class _CodexResponseAssembler:
         """Process one event; True when the stream hit a terminal frame."""
         event_type = _event_field(event, "type", "")
         event_type = event_type if isinstance(event_type, str) else ""
+        self.saw_native_web_search_call |= event_type.startswith("response.web_search_call.")
         handler = self._EXACT_HANDLERS.get(event_type) or next((h for m, h in self._FUZZY_HANDLERS if m(event_type)), None)
         return bool(handler(self, event, event_type)) if handler is not None else False
 
@@ -1082,7 +1086,25 @@ class _CodexResponseAssembler:
         return SimpleNamespace(
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
-            error=self.terminal_error, service_tier=self.terminal_service_tier)
+            error=self.terminal_error, service_tier=self.terminal_service_tier,
+            saw_native_web_search_call=self.saw_native_web_search_call)
+
+
+def _mark_native_web_search_failure(agent: Any, response: Any, request_tools: Any) -> Any:
+    """Mark only Codex requests whose declared native search ran before a server error."""
+    tools = request_tools if isinstance(request_tools, list) else []
+    error = _event_field(response, "error")
+    failure = bool(
+        callable(getattr(agent, "_is_codex_backend", None))
+        and agent._is_codex_backend()
+        and any(isinstance(tool, dict) and tool.get("type") == "web_search" for tool in tools)
+        and _event_field(response, "saw_native_web_search_call", False)
+        and str(_event_field(response, "status", "")).strip().lower() == "failed"
+        and _event_field(error, "code") == "server_error"
+    )
+    if isinstance(response, SimpleNamespace):
+        response.native_web_search_failure = failure
+    return response
 
 
 def _consume_codex_event_stream(
@@ -1222,7 +1244,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise TimeoutError("Codex Responses stream request retired before terminal response")
         return bool(agent._interrupt_requested)
 
+    attempt_request_tools = None
+
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal attempt_request_tools
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1234,6 +1259,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
+        attempt_request_tools = stream_kwargs.get("tools")
         return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
 
     def _log_failure(exc: BaseException) -> None:
@@ -1338,6 +1364,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     call_role = ("delegated" if getattr(agent, "is_subagent", False)
                  else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
     for attempt in range(max_stream_retries + 1):
+        attempt_request_tools = None
         if not _request_is_current():
             raise TimeoutError("Codex Responses stream request retired before retry")
         if agent._interrupt_requested:
@@ -1389,7 +1416,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
-                    return event_stream.final_response
+                    return _mark_native_web_search_failure(agent, event_stream.final_response, attempt_request_tools)
                 raise
             except _APIConnectionError as exc:
                 # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
@@ -1412,7 +1439,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
                                final.status, final.incomplete_details, final.error,
                                sum(len(p) for p in agent._codex_streamed_text_parts), agent._client_log_context())
-            return final
+            return _mark_native_web_search_failure(agent, final, attempt_request_tools)
         finally:
             # relay_llm.stream is ManagedLlmStream, whose close() always owns the provider stream; only
             # when construction itself failed (event_stream None) may a raw stream be left to close here.

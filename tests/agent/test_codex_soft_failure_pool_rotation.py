@@ -8,7 +8,7 @@ sees them; ``retry_invalid_response`` has to classify ``response.error`` itself.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.agent_runtime_helpers import recover_with_credential_pool
 from agent.credential_pool import STATUS_EXHAUSTED, CredentialPool, PooledCredential
@@ -102,3 +102,55 @@ def test_content_policy_soft_failure_leaves_pool_alone():
     assert agent.swapped_to == [] and agent.api_key == "tok-0-1234567890"
     assert all(e.last_status is None for e in pool.entries())
     agent._try_activate_fallback.assert_called()
+
+
+def test_native_web_search_server_error_stops_replay_and_points_to_client_backend():
+    pool = CredentialPool("openai-codex", [_entry(0)])
+    agent = _Agent(pool)
+    response = _soft_failure("server_error", "server_error")
+    response.native_web_search_failure = True
+
+    verdict = _run(agent, response)
+
+    assert verdict.action == "return"
+    assert verdict.result["failure_reason"] == "server_error"
+    assert verdict.result["failure_retryable"] is False
+    assert "web.search_backend" in verdict.result["final_response"]
+    assert "client-side" in verdict.result["final_response"]
+    agent._try_activate_fallback.assert_called_once()
+
+
+def test_unrelated_codex_server_error_keeps_existing_retry_path():
+    pool = CredentialPool("openai-codex", [_entry(0)])
+    agent = _Agent(pool)
+
+    verdict = _run(agent, _soft_failure("server_error", "server_error"))
+
+    assert verdict.action == "continue"
+    agent._try_activate_fallback.assert_called_once()
+
+
+def test_native_web_search_failure_uses_configured_fallback_before_terminal_copy():
+    pool = CredentialPool("openai-codex", [_entry(0)])
+    agent = _Agent(pool)
+    agent._fallback_chain = ["fallback"]
+    agent._try_activate_fallback.return_value = True
+    response = _soft_failure("server_error", "server_error")
+    response.native_web_search_failure = True
+
+    with patch("agent.conversation_loop._arm_fallback_restart", return_value="fallback prompt"):
+        verdict = _run(agent, response)
+
+    assert verdict.action == "break"
+    assert agent._try_activate_fallback.call_count == 1
+
+
+def test_native_web_search_marker_with_other_error_code_keeps_retry_path():
+    pool = CredentialPool("openai-codex", [_entry(0)])
+    agent = _Agent(pool)
+    response = _soft_failure("rate_limit_exceeded", "slow down")
+    response.native_web_search_failure = True
+
+    verdict = _run(agent, response)
+
+    assert verdict.action == "continue"
