@@ -379,6 +379,58 @@ async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkey
 
 
 @pytest.mark.asyncio
+async def test_process_completion_keeps_the_current_route_owner(monkeypatch, tmp_path):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    route = runner.session_store.get_or_create_session(source)
+    process_owner = "delegated-child"
+    await runner._session_db.create_session(
+        process_owner, "subagent", parent_session_id=route.session_id,
+    )
+    event = {
+        "type": "completion",
+        "session_id": "proc_child",
+        "session_key": route.session_key,
+        "parent_session_id": process_owner,
+        "exit_code": 0,
+    }
+
+    await runner._inject_watch_notification("[SYSTEM: process finished]", event)
+    synthetic_event = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[0]
+    resolved = await runner._hmwa_resolve_session(synthetic_event, synthetic_event.source)
+
+    assert resolved is not None
+    assert resolved[1].session_id == route.session_id
+    assert runner.session_store.lookup_by_session_key(route.session_key).session_id == route.session_id
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_notification_pins_its_coordinator(
+    monkeypatch, tmp_path
+):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    route = runner.session_store.get_or_create_session(source)
+    event = {
+        "type": "async_delegation",
+        "session_id": "delegation-child",
+        "session_key": route.session_key,
+        "parent_session_id": route.session_id,
+    }
+
+    await runner._inject_watch_notification("[SYSTEM: delegation finished]", event)
+    synthetic_event = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[
+        0
+    ]
+
+    assert synthetic_event.metadata["gateway_session_id"] == route.session_id
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

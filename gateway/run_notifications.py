@@ -1315,7 +1315,7 @@ class GatewayNotificationsMixin:
             if session_key.startswith("agent:"):
                 metadata["gateway_session_key"] = session_key
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
+            if evt.get("type") == "async_delegation" and parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
             # The queued event's ``message_id`` is the message that STARTED the process, and the
             # persisted origin carries the same stale id. A synthetic completion is not a reply to
