@@ -372,10 +372,12 @@ _DIR_EXISTS_CACHE: dict[str, bool] = {}
 
 
 def _dir_exists_cached(path: str) -> bool:
-    """``os.path.isdir`` memoized per build — ``build_tree`` asks per SESSION, not per path."""
+    """Memoize local checks and skip blocking existence probes for network paths."""
     hit = _DIR_EXISTS_CACHE.get(path)
     if hit is None:
-        hit = _DIR_EXISTS_CACHE[path] = os.path.isdir(path)
+        hit = _DIR_EXISTS_CACHE[path] = (
+            git_probe.is_network_path(path) or os.path.isdir(path)
+        )
     return hit
 
 

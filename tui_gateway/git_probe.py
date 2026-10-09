@@ -6,10 +6,11 @@ would otherwise re-spawn ``git`` on every sidebar open, while the TTL keeps ``gi
 
 from __future__ import annotations
 
+import ntpath
 import os
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 
 from hermes_cli._subprocess_compat import bounded_git_probe
@@ -17,6 +18,46 @@ from hermes_cli._subprocess_compat import bounded_git_probe
 _GIT_TIMEOUT = 1.5
 _WARM_WORKERS = 8
 _NEG_TTL = 30.0  # "not a git repo" TTL: a fresh `git init` shows within seconds
+_DRIVE_REMOTE = 4
+_IS_WINDOWS = os.name == "nt"
+
+
+def _drive_type(root: str) -> int:
+    import ctypes
+
+    get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+    get_drive_type.argtypes = (ctypes.c_wchar_p,)
+    get_drive_type.restype = ctypes.c_uint
+    return get_drive_type(root)
+
+
+def is_network_path(
+    path: str,
+    *,
+    is_windows: bool = _IS_WINDOWS,
+    drive_type: Callable[[str], int] | None = None,
+) -> bool:
+    """Return whether a Windows path can require network I/O just to stat."""
+    if not is_windows:
+        return False
+    value = (path or "").strip()
+    windows_value = value.replace("/", "\\")
+    prefix_value = windows_value.casefold()
+    if prefix_value.startswith(("\\\\?\\unc\\", "\\\\.\\unc\\")):
+        return True
+    if prefix_value.startswith(("\\\\?\\", "\\\\.\\")):
+        drive, _ = ntpath.splitdrive(windows_value)
+        if prefix_value.startswith("\\\\?\\") and len(drive) == 6 and drive[-1] == ":":
+            return (drive_type or _drive_type)(drive[-2:] + "\\") == _DRIVE_REMOTE
+        return False
+    if prefix_value.startswith("\\\\"):
+        return True
+    drive, _ = ntpath.splitdrive(windows_value)
+    return (
+        len(drive) == 2
+        and drive[1] == ":"
+        and (drive_type or _drive_type)(drive + "\\") == _DRIVE_REMOTE
+    )
 
 
 def run_git(cwd: str, *args: str) -> str:
@@ -29,7 +70,7 @@ def run_git(cwd: str, *args: str) -> str:
     """
     # A missing dir can only fail at the price of a fork; deleted worktrees dominate a long
     # session history's cwds, so the stat pays off.
-    if not cwd or not os.path.isdir(cwd):
+    if not cwd or (not is_network_path(cwd) and not os.path.isdir(cwd)):
         return ""
     return bounded_git_probe(["git", "-C", cwd, *args], timeout=_GIT_TIMEOUT)
 
