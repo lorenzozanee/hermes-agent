@@ -170,7 +170,13 @@ def _host_state_dir() -> str:
         return override
     state_home = os.environ.get("XDG_STATE_HOME") or ""
     if not os.path.isabs(state_home):
-        state_home = os.path.join(os.path.expanduser("~"), ".local", "state")
+        if os.name == "nt":
+            home = os.path.expanduser("~")
+        else:
+            import pwd
+
+            home = pwd.getpwuid(os.getuid()).pw_dir  # windows-footgun: ok — POSIX-only branch
+        state_home = os.path.join(home, ".local", "state")
     return os.path.join(state_home, "hermes", "gateway-locks")
 
 

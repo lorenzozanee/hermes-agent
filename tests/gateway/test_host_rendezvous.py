@@ -218,11 +218,18 @@ def test_relative_xdg_state_home_is_ignored(monkeypatch, tmp_path):
     """XDG spec: a relative ``$XDG_STATE_HOME`` is invalid and must be ignored. Honouring one made
     the host lock dir CWD-relative, so two serves started from different directories would each
     take their own "host" lock."""
-    from gateway import status
+    from types import SimpleNamespace
+
+    from gateway import host_state_paths
 
     monkeypatch.delenv("HERMES_GATEWAY_LOCK_DIR", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", "relative/state")
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    if os.name == "nt":
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    else:
+        import pwd
 
-    assert status._get_lock_dir().is_absolute()
-    assert status._get_lock_dir() == tmp_path / ".local" / "state" / "hermes" / status._LOCKS_DIRNAME
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+
+    assert host_state_paths.host_state_dir().is_absolute()
+    assert host_state_paths.host_state_dir() == tmp_path / ".local" / "state" / "hermes" / host_state_paths._LOCKS_DIRNAME

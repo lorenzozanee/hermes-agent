@@ -363,12 +363,12 @@ def test_a_failing_main_pid_probe_keeps_its_own_restart():
 ])
 def test_recovery_host_state_dir_matches_the_gateway_resolver(monkeypatch, env):
     """``update_restart_recovery`` re-implements the lock-dir rule (it may import no Hermes code
-    at runtime); the duplicate must not drift from ``gateway.status._get_lock_dir``."""
-    from gateway.status import _get_lock_dir
+    at runtime); the duplicate must not drift from ``gateway.host_state_paths.host_state_dir``."""
+    from gateway.host_state_paths import host_state_dir
 
     for name in ("HERMES_GATEWAY_LOCK_DIR", "XDG_STATE_HOME"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
-    assert recovery._host_state_dir() == str(_get_lock_dir())
+    assert recovery._host_state_dir() == str(host_state_dir())

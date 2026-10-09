@@ -112,6 +112,49 @@ def test_doctor_raises_an_issue_when_nothing_owns_the_gateway_role(served_host, 
     assert any("gateway start" in i for i in issues), "the outage state produced no remediation"
 
 
+@pytest.mark.platforms("linux")
+def test_s6_doctor_reads_host_record_when_caller_home_differs(tmp_path, capsys, monkeypatch):
+    """Regression for #135590: a terminal-tool HOME must not hide the supervised host record."""
+    from types import SimpleNamespace
+
+    import pwd
+
+    from gateway import host_rendezvous as hr
+    from hermes_cli import doctor_platform
+
+    hermes_home = tmp_path / "hermes"
+    gateway_home = tmp_path / "gateway-home"
+    caller_home = tmp_path / "caller-home"
+    hermes_home.mkdir()
+    gateway_home.mkdir()
+    caller_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_GATEWAY_LOCK_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(gateway_home)))
+
+    monkeypatch.setenv("HOME", str(gateway_home))
+    hr.publish_record(hr.ROLE_GATEWAY, profiles=("default",), home=str(hermes_home))
+    monkeypatch.setenv("HOME", str(caller_home))
+
+    class _Mgr:
+        def is_running(self, name):
+            return name == "gateway-default"
+
+        def list_profile_gateways(self):
+            return ["default"]
+
+    monkeypatch.setattr("hermes_cli.service_manager.detect_service_manager", lambda: "s6")
+    monkeypatch.setattr("hermes_cli.service_manager.S6ServiceManager", _Mgr)
+    issues: list[str] = []
+    doctor_platform._check_s6_supervision(issues)
+    out = capsys.readouterr().out
+
+    assert f"Host gateway: the host gateway (PID {os.getpid()}) serving profiles default" in out
+    assert "No host gateway owns the gateway role" not in out
+    assert not issues
+
+
 @pytest.mark.parametrize("xdg", [False, True])
 def test_doctor_checks_host_unit_linger_under_a_served_profile(served_host, tmp_path, capsys, monkeypatch, xdg):
     from hermes_cli import doctor_platform
