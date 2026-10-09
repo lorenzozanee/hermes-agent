@@ -183,7 +183,31 @@ function mutateInFlight(ids: Array<null | string | undefined>, add: boolean): vo
 }
 
 export const beginSessionMutation = (ids: Array<null | string | undefined>): void => mutateInFlight(ids, true)
-export const endSessionMutation = (ids: Array<null | string | undefined>): void => mutateInFlight(ids, false)
+
+export const endSessionMutation = (ids: Array<null | string | undefined>): void => {
+  const inFlight = $sessionMutationsInFlight.get()
+  const removed = $removedSessionIds.get()
+
+  // Pages started during the mutation already captured the tombstone generation.
+  const completed = new Set(
+    ids.map(id => id?.trim()).filter((id): id is string => Boolean(id && inFlight.has(id) && removed.has(id)))
+  )
+
+  if (completed.size) {
+    const generations = new Map(tombstoneGenerations)
+    const edges = new Map(lastRemovalEdge)
+
+    for (const id of completed) {
+      generations.set(id, (generations.get(id) ?? 0) + 1)
+      edges.set(id, true)
+    }
+
+    tombstoneGenerations = generations
+    lastRemovalEdge = edges
+  }
+
+  mutateInFlight(ids, false)
+}
 
 /** The session is on its way out: already tombstoned, or its delete/archive RPC
  *  is still in flight. Either way the durable row is doomed, so nothing may

@@ -409,6 +409,39 @@ describe('refreshSessions identity + loading hygiene', () => {
     removals.untombstoneSessions(['doomed'])
   })
 
+  it('drops a page started during archive after the tombstone is pruned (#135641)', async () => {
+    const pending = deferred<SidebarSessionsResponse>()
+    listSidebarSessions.mockReturnValue(pending.promise)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    const removals = await import('@/store/session-removal')
+    removals.tombstoneSessions(['during-archive'])
+    removals.beginSessionMutation(['during-archive'])
+    removed.ids = new Set(['during-archive'])
+    setSessions([row('during-archive'), row('mine')])
+    settled.ids = ['during-archive']
+
+    try {
+      const refresh = result.current.refreshSessions()
+
+      // The request starts after the optimistic tombstone but before the archive
+      // RPC resolves, then returns a stale row after the tree prunes the tombstone.
+      removals.endSessionMutation(['during-archive'])
+      removed.ids = new Set()
+
+      await act(async () => {
+        pending.resolve(sidebar({ sessions: [row('during-archive'), row('mine')] }))
+        await refresh
+      })
+
+      expect($sessions.get().map(s => s.id)).toEqual(['mine'])
+    } finally {
+      removals.endSessionMutation(['during-archive'])
+      removals.untombstoneSessions(['during-archive'])
+      removed.ids = new Set()
+    }
+  })
+
   it('re-admits a row whose archive rolled back mid-flight (release edge)', async () => {
     // A failed archive untombstones immediately; a page that raced the
     // rollback must still list the row — the guard only vetoes rows whose
