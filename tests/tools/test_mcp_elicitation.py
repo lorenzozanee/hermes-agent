@@ -50,7 +50,8 @@ def _url_params(message="open this url", url="https://example.com/auth", elicita
 
 class TestElicitationHandlerFormMode:
     def test_user_accepts_once_returns_accept(self):
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params(
             "authorize a payment of $0.50",
             {"properties": {"approved": {"type": "boolean"}}},
@@ -72,7 +73,8 @@ class TestElicitationHandlerFormMode:
         wait times out (resolved=False). The handler should propagate
         that as ElicitResult(action='cancel') so the server can
         distinguish 'no answer' from 'no'."""
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         with patch("tools.approval_prompt.request_elicitation_consent", return_value="cancel"):
@@ -84,7 +86,8 @@ class TestElicitationHandlerFormMode:
 
 class TestElicitationHandlerFailureModes:
     def test_url_mode_is_declined_without_prompting(self):
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _url_params()
 
         # If the handler tried to prompt, this would raise AssertionError
@@ -99,7 +102,8 @@ class TestElicitationHandlerFailureModes:
         assert handler.metrics["declined"] == 1
 
     def test_exception_in_approval_fails_closed_to_decline(self):
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         with patch(
@@ -121,7 +125,8 @@ class TestElicitationHandlerFailureModes:
         # _safe_numeric clamps `timeout` to a minimum of 1s, so the
         # effective wait_for budget is 1s here. Stall longer than that
         # so the wait_for reliably fires TimeoutError.
-        handler = ElicitationHandler("pay", {"timeout": 0.05})
+        handler = ElicitationHandler("pay", {"timeout": 0.05}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         def stall(*_args, **_kwargs):
@@ -172,7 +177,8 @@ class TestElicitationHandlerContextBridge:
             "context, otherwise the test would pass even without replay."
         )
 
-        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: captured)
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: captured,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         with patch("tools.approval_prompt.request_elicitation_consent", side_effect=fake_consent):
@@ -189,7 +195,8 @@ class TestElicitationHandlerContextBridge:
         call) the handler must still invoke the consent router -- just
         without the contextvar replay. Otherwise CLI/TUI sessions, which
         don't set HERMES_SESSION_PLATFORM, would break."""
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept") as m:
@@ -202,13 +209,45 @@ class TestElicitationHandlerContextBridge:
     def test_pending_call_context_none_does_not_crash(self):
         """The ``call_context`` thunk returns None between tool
         calls. An elicitation arriving in that window must not crash."""
-        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None)
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         params = _form_params()
 
         with patch("tools.approval_prompt.request_elicitation_consent", return_value="decline"):
             result = asyncio.run(handler(context=None, params=params))
 
         assert result.action == "decline"
+
+    @pytest.mark.parametrize(("choice", "expected"), [("once", "accept"), ("deny", "decline")])
+    def test_captured_approval_callback_is_used_by_consent_thread(self, monkeypatch, choice, expected):
+        """The approval callback is thread-local and must cross the async-to-thread hop."""
+        import contextvars
+
+        from tools import approval_prompt, terminal_tool
+
+        seen = []
+        callback = lambda *_args, **_kwargs: seen.append("requested") or choice
+        context = contextvars.copy_context()
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: context,
+                                     call_approval_callback=lambda: callback)
+
+        monkeypatch.setattr(approval_prompt._ctx, "_no_user_can_answer", lambda: False)
+
+        def capture_prompt(*_args, approval_callback=None, **_kwargs):
+            if approval_callback is None:
+                return "decline"
+            return approval_callback("Allow payment?", "an MCP server asks")
+
+        monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", capture_prompt)
+        previous = terminal_tool._get_approval_callback()
+        terminal_tool.set_approval_callback(callback)
+        try:
+            result = asyncio.run(handler(context=None, params=_form_params("Allow payment?")))
+        finally:
+            terminal_tool.set_approval_callback(previous)
+
+        assert result.action == expected
+        assert seen == ["requested"]
 
 
 class TestRequestedSchemaFieldName:
@@ -242,7 +281,8 @@ class TestRequestedSchemaFieldName:
                 },
             },
         )
-        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler = ElicitationHandler("pay", {"timeout": 5}, call_context=lambda: None,
+                                     call_approval_callback=lambda: None)
         captured: dict = {}
 
         def _capture(*args, **kwargs):

@@ -587,9 +587,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
+                    from tools.terminal_tool import _get_approval_callback
+                    server._pending_approval_callback = _get_approval_callback()
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
                 finally:
                     server._pending_call_context = None
+                    server._pending_approval_callback = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
                 server._mark_session_proven()
             image_paths.clear()

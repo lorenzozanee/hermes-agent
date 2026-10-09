@@ -323,6 +323,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_list_cache_meta",
         "_max_lifetime_seconds",
         "_park_reason",
+        "_pending_approval_callback",
         "_pending_call_context",
         "_pending_refresh_tasks",
         "_permanent_grace_used",
@@ -424,6 +425,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # contextvars snapshot inside session.call_tool(): the SDK runs elicitation/create on a
         # task that does not inherit HERMES_SESSION_PLATFORM, so the callback replays this.
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._pending_approval_callback: Optional[Callable] = None
         self._lifecycle_started_at = self._last_tool_call_at = time.monotonic()
         self._idle_timeout_seconds = self._max_lifetime_seconds = self._recycled_reason = None
         # Handshake InitializeResult: the server's REAL advertised capabilities.

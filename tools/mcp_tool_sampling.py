@@ -263,7 +263,8 @@ class ElicitationHandler:
     _ANSWER_RESULTS = {"accept": ("accept", "accepted"), "cancel": ("cancel", "errors")}
 
     def __init__(self, server_name: str, config: dict,
-                 call_context: Callable[[], Optional[Context]] = lambda: None):
+                 call_context: Callable[[], Optional[Context]],
+                 call_approval_callback: Callable[[], Optional[Callable]]):
         self.server_name = server_name
         # 5 min mirrors the gateway approval default so async surfaces (Telegram, Slack) can respond.
         self.timeout = _safe_numeric(config.get("timeout", 300), 300, float)
@@ -271,6 +272,7 @@ class ElicitationHandler:
         # between calls). A thunk, not the task: mcp_tool_server_run imports this module, so
         # MCPServerTask cannot be named here.
         self._call_context = call_context
+        self._call_approval_callback = call_approval_callback
         self.metrics = {"requests": 0, "accepted": 0, "declined": 0, "errors": 0}
 
     def session_kwargs(self) -> dict:
@@ -291,7 +293,19 @@ class ElicitationHandler:
         consent = functools.partial(request_elicitation_consent, message, description,
                                     timeout_seconds=int(self.timeout), surface=f"mcp-elicitation/{self.server_name}")
         captured = self._call_context()
-        return consent if captured is None else (lambda: captured.copy().run(consent))
+        approval_callback = self._call_approval_callback()
+
+        def invoke():
+            from tools.terminal_tool import _get_approval_callback, set_approval_callback
+
+            previous = _get_approval_callback()
+            set_approval_callback(approval_callback)
+            try:
+                return consent() if captured is None else captured.copy().run(consent)
+            finally:
+                set_approval_callback(previous)
+
+        return invoke
 
     async def __call__(self, context, params):
         """SDK elicitation callback (``ElicitationFnT``). Returns ElicitResult or ErrorData."""
