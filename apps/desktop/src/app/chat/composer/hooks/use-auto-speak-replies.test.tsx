@@ -45,7 +45,7 @@ describe('useAutoSpeakReplies — Edge TTS fallback chain (#93515)', () => {
     const $messages = atom<ChatMessage[]>([])
 
     // The exact pendingReply/markSpoken contract use-composer-voice.ts wires
-    // up for this hook, backed by the real ordinal-anchored dedupe.
+    // up for this hook, backed by the real user-turn spoken-reply anchor.
     const pendingReply = () => {
       const messages = $messages.get()
       const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
@@ -130,7 +130,7 @@ describe('useAutoSpeakReplies — Edge TTS fallback chain (#93515)', () => {
     expect(playSpeechText).toHaveBeenCalledTimes(1)
   })
 
-  it('speaks a tool-folded rewrite once when the assistant ordinal drifts', async () => {
+  it('does not re-speak a tool-folded reply when the next user message arrives', async () => {
     $autoSpeakReplies.set(true)
 
     const $messages = atom<ChatMessage[]>([])
@@ -174,7 +174,8 @@ describe('useAutoSpeakReplies — Edge TTS fallback chain (#93515)', () => {
       // Tool rows fold into one durable bubble. The assistant ordinal moves.
       $messages.set([
         { id: 'u1', parts: [assistantTextPart('do the thing')], role: 'user' },
-        assistantMessage('durable-42', 'the folded answer')
+        assistantMessage('durable-42', 'the folded answer'),
+        { id: 'u2', parts: [assistantTextPart('next prompt')], role: 'user' }
       ])
       setVoicePlaybackState({ ...IDLE_STATE })
 
