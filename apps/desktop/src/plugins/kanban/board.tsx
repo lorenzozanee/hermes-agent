@@ -82,6 +82,7 @@ import {
   useKanbanScope
 } from './api'
 import { BoardSwitcher } from './board-switcher'
+import { CompletionSummaryDialog, hasCompletionResult } from './completion-summary-dialog'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
@@ -575,6 +576,7 @@ function NewTaskDialog({
   const isTriage = target === 'triage'
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
+  const [result, setResult] = useState('')
   const [assignee, setAssignee] = useState('')
   const [priority, setPriority] = useState('0')
   const [skills, setSkills] = useState('')
@@ -587,6 +589,7 @@ function NewTaskDialog({
   const [goalMode, setGoalMode] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
+  const [createdTaskId, setCreatedTaskId] = useState<null | string>(null)
   const [estimate, setEstimate] = useState<null | TaskEstimate>(null)
 
   // Rough effort estimate from the typed title/body (before the task exists),
@@ -610,6 +613,7 @@ function NewTaskDialog({
     if (target) {
       setTitle('')
       setBodyText('')
+      setResult('')
       setAssignee('')
       setPriority('0')
       setSkills('')
@@ -620,6 +624,7 @@ function NewTaskDialog({
       setGoalMode(false)
       setError(null)
       setBusy(false)
+      setCreatedTaskId(null)
       setEstimate(null)
     }
   }, [target, boardDefaultKind])
@@ -627,12 +632,13 @@ function NewTaskDialog({
   const submit = async () => {
     const trimmed = title.trim()
 
-    if (!trimmed || !target || busy) {
+    if (!trimmed || !target || busy || (target === 'done' && !result.trim())) {
       return
     }
 
     setBusy(true)
     setError(null)
+    let retryTaskId = createdTaskId
 
     try {
       const skillList = skills
@@ -642,23 +648,33 @@ function NewTaskDialog({
 
       // create() derives status (triage flag → 'triage', else 'ready'); move to
       // the requested column when they differ, so a per-column add lands right.
-      const { task, warning } = await createTask({
-        assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
-        body: bodyText.trim() || undefined,
-        goal_mode: goalMode,
-        parents: parent ? [parent] : undefined,
-        priority: Number(priority) || 0,
-        skills: skillList.length ? skillList : undefined,
-        title: trimmed,
-        triage: isTriage,
-        workspace_kind: workspaceKind,
-        ...overrideCreateFields(modelOverride),
-        // Empty → backend inherits the board's default project dir.
-        workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
-      })
+      const { task, warning } = createdTaskId
+        ? { task: { id: createdTaskId, status: 'ready' }, warning: null }
+        : await createTask({
+            assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
+            body: bodyText.trim() || undefined,
+            goal_mode: goalMode,
+            parents: parent ? [parent] : undefined,
+            priority: Number(priority) || 0,
+            skills: skillList.length ? skillList : undefined,
+            title: trimmed,
+            triage: isTriage,
+            workspace_kind: workspaceKind,
+            ...overrideCreateFields(modelOverride),
+            // Empty → backend inherits the board's default project dir.
+            workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
+          })
 
       if (task && task.status !== target) {
-        await patchTask(task.id, { status: target })
+        if (target === 'done') {
+          retryTaskId = task.id
+          setCreatedTaskId(task.id)
+        }
+
+        await patchTask(
+          task.id,
+          target === 'done' ? { status: target, result: result.trim(), summary: result.trim() } : { status: target }
+        )
       }
 
       // Dispatcher-presence warning ("this ready task will sit idle") — not an
@@ -670,7 +686,11 @@ function NewTaskDialog({
       await qc.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
       onClose()
     } catch (err) {
-      setError(errText(err))
+      if (retryTaskId) {
+        await qc.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
+      }
+
+      setError(retryTaskId && target === 'done' ? `${k.completionMoveFailed} ${errText(err)}` : errText(err))
       setBusy(false)
     }
   }
@@ -708,6 +728,16 @@ function NewTaskDialog({
             placeholder={k.descPlaceholder}
             value={bodyText}
           />
+          {target === 'done' && (
+            <Field label={k.result}>
+              <Textarea
+                aria-label={k.result}
+                onChange={event => setResult(event.target.value)}
+                placeholder={k.completionPlaceholder}
+                value={result}
+              />
+            </Field>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <Field label={k.priority}>
@@ -839,8 +869,11 @@ function NewTaskDialog({
           <Button onClick={onClose} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={!title.trim() || busy} onClick={() => void submit()}>
-            {busy ? k.creating : k.createTask}
+          <Button
+            disabled={!title.trim() || busy || (target === 'done' && !result.trim())}
+            onClick={() => void submit()}
+          >
+            {busy ? k.creating : createdTaskId ? k.retryCompletion : k.createTask}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -966,12 +999,14 @@ function SelectionBar({
   columns,
   onClear,
   onDone,
-  selected
+  selected,
+  tasks
 }: {
   columns: string[]
   onClear: () => void
   onDone: (failed: string[]) => void
   selected: ReadonlySet<string>
+  tasks: KanbanTask[]
 }) {
   const k = useKanban()
   const qc = useQueryClient()
@@ -991,8 +1026,56 @@ function SelectionBar({
     onDone(failed.map(f => f.id))
   }
 
+  const [completionOpen, setCompletionOpen] = useState(false)
+
   const bulk = useMutation({
-    mutationFn: (patch: Record<string, unknown>) => bulkTasks([...selected], patch),
+    mutationFn: async (patch: Record<string, unknown>) => {
+      const ids = [...selected]
+
+      if (patch.status !== 'done') {
+        return bulkTasks(ids, patch)
+      }
+
+      const taskById = new Map(tasks.map(task => [task.id, task]))
+      const summary = typeof patch.summary === 'string' ? patch.summary : undefined
+
+      return {
+        results: await Promise.all(
+          ids.map(async id => {
+            const task = taskById.get(id)
+
+            if (!task) {
+              return { id, ok: false, error: 'Task data unavailable' }
+            }
+
+            if (task.status === 'done') {
+              return { id, ok: true }
+            }
+
+            const hasResult = hasCompletionResult(task.result)
+            let result: null | string | undefined
+
+            if (hasResult) {
+              result = task.result
+            } else if (task.status !== 'review') {
+              result = summary
+            }
+
+            try {
+              await patchTask(id, {
+                status: 'done',
+                ...(result ? { result } : {}),
+                ...(!hasResult && task.status !== 'review' && summary ? { summary } : {})
+              })
+
+              return { id, ok: true }
+            } catch (error) {
+              return { id, ok: false, error: errText(error) }
+            }
+          })
+        )
+      }
+    },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: data => finish(data.results.filter(r => !r.ok))
   })
@@ -1017,6 +1100,25 @@ function SelectionBar({
   // never race Radix's dismiss layer into two open menus.
   const [menu, setMenu] = useState<'assign' | 'move' | null>(null)
 
+  const moveTo = (status: string) => {
+    setMenu(null)
+
+    if (status !== 'done') {
+      bulk.mutate({ status })
+
+      return
+    }
+
+    const selectedTasks = tasks.filter(task => selected.has(task.id) && task.status !== 'done')
+    const needsSummary = selectedTasks.some(task => task.status !== 'review' && !hasCompletionResult(task.result))
+
+    if (needsSummary) {
+      setCompletionOpen(true)
+    } else {
+      bulk.mutate({ status })
+    }
+  }
+
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-4 z-10 flex justify-center px-4">
       {/* Flat overlay: stroke + elevated surface do the separating, no shadow. */}
@@ -1034,7 +1136,7 @@ function SelectionBar({
             {columns
               .filter(name => !isLockedTarget(name))
               .map(name => (
-                <DropdownMenuItem key={name} onSelect={() => bulk.mutate({ status: name })}>
+                <DropdownMenuItem key={name} onSelect={() => moveTo(name)}>
                   <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
                   {columnLabel(k, name)}
                 </DropdownMenuItem>
@@ -1085,6 +1187,16 @@ function SelectionBar({
           </Button>
         </Tip>
       </div>
+      <CompletionSummaryDialog
+        description={k.bulkCompletionDescription}
+        onCancel={() => setCompletionOpen(false)}
+        onSubmit={summary => {
+          setCompletionOpen(false)
+          bulk.mutate({ status: 'done', summary })
+        }}
+        open={completionOpen}
+        pending={busy}
+      />
     </div>
   )
 }
@@ -1113,6 +1225,7 @@ export function KanbanBoardPage() {
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  const [completionTaskId, setCompletionTaskId] = useState<null | string>(null)
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
@@ -1199,7 +1312,8 @@ export function KanbanBoardPage() {
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
 
   const moveMut = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
+    mutationFn: ({ id, status, result, summary }: { id: string; status: string; result?: string; summary?: string }) =>
+      patchTask(id, { status, ...(result !== undefined ? { result } : {}), ...(summary ? { summary } : {}) }),
     onMutate: async ({ id, status }) => {
       await qc.cancelQueries({ queryKey: boardKey(scope, slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(scope, slug, archived))
@@ -1258,7 +1372,13 @@ export function KanbanBoardPage() {
       return
     }
 
-    moveMut.mutate({ id, status })
+    if (status === 'done' && task.status !== 'review' && !hasCompletionResult(task.result)) {
+      setCompletionTaskId(id)
+
+      return
+    }
+
+    moveMut.mutate({ id, status, ...(hasCompletionResult(task.result) ? { result: task.result! } : {}) })
   }
 
   const errorMessage = error ? errText(error) : null
@@ -1434,9 +1554,22 @@ export function KanbanBoardPage() {
           onClear={() => setSelected(new Set())}
           onDone={failed => setSelected(new Set(failed))}
           selected={selected}
+          tasks={board?.columns.flatMap(col => col.tasks) ?? []}
         />
       )}
 
+      <CompletionSummaryDialog
+        onCancel={() => setCompletionTaskId(null)}
+        onSubmit={summary => {
+          if (completionTaskId) {
+            moveMut.mutate({ id: completionTaskId, status: 'done', result: summary, summary })
+          }
+
+          setCompletionTaskId(null)
+        }}
+        open={completionTaskId !== null}
+        pending={moveMut.isPending}
+      />
       <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
       <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
     </div>

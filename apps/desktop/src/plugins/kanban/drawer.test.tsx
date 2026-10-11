@@ -239,6 +239,77 @@ describe('task attachment compatibility', () => {
   })
 })
 
+describe('manual task completion', () => {
+  async function chooseDone(status: 'ready' | 'review' = 'ready') {
+    fireEvent.pointerDown(await screen.findByRole('button', { name: new RegExp(status, 'i') }), { button: 0 })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Done' }))
+  }
+
+  it('requires and sends a summary before moving an empty task to Done', async () => {
+    detail = { ...legacyDetail, task: { ...legacyDetail.task, status: 'ready', result: null } }
+    openDrawer()
+
+    await chooseDone()
+
+    const summary = await screen.findByRole('textbox', { name: /result/i })
+    expect(((await screen.findByRole('button', { name: /complete task/i })) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(summary, { target: { value: '   ' } })
+    expect((screen.getByRole('button', { name: /complete task/i }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(summary, { target: { value: 'Approved the completed work.' } })
+    fireEvent.click(screen.getByRole('button', { name: /complete task/i }))
+
+    await waitFor(() => {
+      expect(rest).toHaveBeenCalledWith(
+        '/tasks/t_example',
+        expect.objectContaining({
+          method: 'PATCH',
+          body: { status: 'done', result: 'Approved the completed work.', summary: 'Approved the completed work.' }
+        })
+      )
+    })
+  })
+
+  it('leaves the task unchanged when the completion prompt is cancelled', async () => {
+    detail = { ...legacyDetail, task: { ...legacyDetail.task, status: 'ready', result: null } }
+    openDrawer()
+    await chooseDone()
+    await screen.findByRole('textbox', { name: /result/i })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    expect(rest.mock.calls.some(([path, options]) => path === '/tasks/t_example' && options?.method === 'PATCH')).toBe(
+      false
+    )
+  })
+
+  it('preserves an existing task result without prompting', async () => {
+    detail = { ...legacyDetail, task: { ...legacyDetail.task, status: 'ready', result: 'Existing evidence.' } }
+    openDrawer()
+    await chooseDone()
+
+    await waitFor(() => {
+      expect(rest).toHaveBeenCalledWith(
+        '/tasks/t_example',
+        expect.objectContaining({ method: 'PATCH', body: { status: 'done', result: 'Existing evidence.' } })
+      )
+    })
+    expect(screen.queryByRole('textbox', { name: /result/i })).toBeNull()
+  })
+
+  it('keeps the review approval path free of the result prompt', async () => {
+    detail = { ...legacyDetail, task: { ...legacyDetail.task, status: 'review', result: null } }
+    openDrawer()
+    await chooseDone('review')
+
+    await waitFor(() => {
+      expect(rest).toHaveBeenCalledWith(
+        '/tasks/t_example',
+        expect.objectContaining({ method: 'PATCH', body: { status: 'done' } })
+      )
+    })
+    expect(screen.queryByRole('textbox', { name: /result/i })).toBeNull()
+  })
+})
+
 describe('task modal dialog', () => {
   it('is a modal dialog named by the task title that Esc dismisses', async () => {
     detail = { ...legacyDetail, attachments: [] }

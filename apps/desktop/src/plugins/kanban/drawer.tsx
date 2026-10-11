@@ -56,6 +56,7 @@ import {
   uploadAttachment,
   useKanbanScope
 } from './api'
+import { CompletionSummaryDialog, hasCompletionResult } from './completion-summary-dialog'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -856,6 +857,7 @@ export function TaskDrawer({
 
   const task = detail?.task
   const running = task?.status === 'running'
+  const [completionOpen, setCompletionOpen] = useState(false)
   const defaultAssignee = useDefaultAssignee()
 
   const { data: log } = useQuery({
@@ -873,8 +875,9 @@ export function TaskDrawer({
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
-    mutationFn: (status: string) => patchTask(id!, { status }),
-    onMutate: async status => {
+    mutationFn: ({ status, result, summary }: { status: string; result?: string; summary?: string }) =>
+      patchTask(id!, { status, ...(result !== undefined ? { result } : {}), ...(summary ? { summary } : {}) }),
+    onMutate: async ({ status }) => {
       await qc.cancelQueries({ queryKey: taskKey(scope, slug, id!) })
       const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(scope, slug, id!))
 
@@ -956,7 +959,13 @@ export function TaskDrawer({
       return
     }
 
-    moveMut.mutate(status)
+    if (status === 'done' && task.status !== 'review' && !hasCompletionResult(task.result)) {
+      setCompletionOpen(true)
+
+      return
+    }
+
+    moveMut.mutate({ status, ...(hasCompletionResult(task.result) ? { result: task.result! } : {}) })
   }
 
   // The shared Dialog owns the chrome tokens, focus trap, Esc and outside-click
@@ -1179,6 +1188,15 @@ export function TaskDrawer({
           )}
         </div>
       </DialogContent>
+      <CompletionSummaryDialog
+        onCancel={() => setCompletionOpen(false)}
+        onSubmit={summary => {
+          setCompletionOpen(false)
+          moveMut.mutate({ status: 'done', result: summary, summary })
+        }}
+        open={completionOpen}
+        pending={moveMut.isPending}
+      />
     </Dialog>
   )
 }

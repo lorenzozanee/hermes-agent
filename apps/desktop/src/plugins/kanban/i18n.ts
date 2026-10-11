@@ -140,6 +140,13 @@ type KanbanMessages = {
   cancelEdit: string
   noDescription: string
   result: string
+  completionPrompt: string
+  completionDescription: string
+  bulkCompletionDescription: string
+  completionPlaceholder: string
+  completeTask: string
+  completionMoveFailed: string
+  retryCompletion: string
   latestSummary: string
   dependencies: string
   blockedBy: string
@@ -373,6 +380,13 @@ export const en: KanbanMessages = {
   cancelEdit: 'Cancel edit',
   noDescription: 'No description yet.',
   result: 'Result',
+  completionPrompt: 'Add a result to complete this task',
+  completionDescription: 'A short result or summary is required before moving to Done.',
+  bulkCompletionDescription: 'This result will be used for selected tasks that do not already have a result.',
+  completionPlaceholder: 'What was completed?',
+  completeTask: 'Complete task',
+  completionMoveFailed: 'The task was created but could not be moved to Done. It remains on the board.',
+  retryCompletion: 'Retry completion',
   latestSummary: 'Latest summary',
   dependencies: 'Dependencies',
   blockedBy: 'Blocked by',
@@ -600,6 +614,13 @@ const ja: KanbanMessages = {
   cancelEdit: '編集をキャンセル',
   noDescription: 'まだ説明はありません。',
   result: '結果',
+  completionPrompt: '結果を入力してタスクを完了',
+  completionDescription: '完了に移動する前に、短い結果または要約が必要です。',
+  bulkCompletionDescription: 'この結果は、結果が未入力の選択中タスクに適用されます。',
+  completionPlaceholder: '何が完了しましたか？',
+  completeTask: 'タスクを完了',
+  completionMoveFailed: 'タスクは作成されましたが、完了に移動できませんでした。ボード上に残っています。',
+  retryCompletion: '完了を再試行',
   latestSummary: '最新のサマリー',
   dependencies: '依存関係',
   blockedBy: 'ブロック元',
@@ -826,6 +847,13 @@ const zh: KanbanMessages = {
   cancelEdit: '取消编辑',
   noDescription: '暂无描述。',
   result: '结果',
+  completionPrompt: '添加结果后完成此任务',
+  completionDescription: '移动到“已完成”前需要填写简短结果或摘要。',
+  bulkCompletionDescription: '此结果将用于所选任务中尚无结果的任务。',
+  completionPlaceholder: '完成了什么？',
+  completeTask: '完成任务',
+  completionMoveFailed: '任务已创建，但无法移至“已完成”。任务仍保留在看板上。',
+  retryCompletion: '重试完成',
   latestSummary: '最新摘要',
   dependencies: '依赖关系',
   blockedBy: '受阻于',
@@ -1050,6 +1078,13 @@ const zhHant: KanbanMessages = {
   cancelEdit: '取消編輯',
   noDescription: '尚無描述。',
   result: '結果',
+  completionPrompt: '新增結果後完成此任務',
+  completionDescription: '移至「已完成」前需要填寫簡短結果或摘要。',
+  bulkCompletionDescription: '此結果將用於所選任務中尚無結果的任務。',
+  completionPlaceholder: '完成了什麼？',
+  completeTask: '完成任務',
+  completionMoveFailed: '任務已建立，但無法移至「已完成」。任務仍保留在看板上。',
+  retryCompletion: '重試完成',
   latestSummary: '最新摘要',
   dependencies: '相依關係',
   blockedBy: '受阻於',

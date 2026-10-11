@@ -8,6 +8,7 @@ export interface KanbanTask {
   title: string
   body?: null | string
   status: string
+  result?: null | string
   assignee?: null | string
   priority?: number
   tenant?: null | string
