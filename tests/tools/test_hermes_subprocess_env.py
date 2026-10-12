@@ -12,8 +12,12 @@ full credential environment. Two tiers:
 """
 
 import os
+import pathlib
 from unittest.mock import patch
 
+import pytest
+
+from tests.tools._child_env_fixtures import windows_home_env
 from tools.environments.local import hermes_subprocess_env
 from tools.environments.local_env_policy import _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
@@ -37,6 +41,7 @@ _SAFE_SAMPLE = {
     "HOME": "/home/user",
     "USER": "testuser",
     "MY_APP_VAR": "keep-me",
+    **windows_home_env(),
 }
 
 
@@ -46,6 +51,14 @@ def _build(extra=None, *, inherit_credentials=False):
         env.update(extra)
     with patch.dict(os.environ, env, clear=True):
         return hermes_subprocess_env(inherit_credentials=inherit_credentials)
+
+
+@pytest.mark.platforms("windows")
+def test_scrubbed_environment_keeps_windows_home_resolvable():
+    with patch.dict(os.environ, _SAFE_SAMPLE, clear=True):
+        result = hermes_subprocess_env()
+        assert pathlib.Path.home().is_absolute()
+    assert result.get("USERPROFILE") == _SAFE_SAMPLE.get("USERPROFILE")
 
 
 class TestStripByDefault:

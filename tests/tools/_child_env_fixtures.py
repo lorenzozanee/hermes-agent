@@ -12,6 +12,10 @@ from unittest.mock import patch
 import pytest
 
 
+def windows_home_env():
+    return {key: os.environ[key] for key in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH") if key in os.environ}
+
+
 @pytest.fixture
 def child_env(monkeypatch, tmp_path):
     # Never dump the operator's environment or source their shell startup files.

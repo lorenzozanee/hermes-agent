@@ -10,11 +10,10 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.tools._child_env_fixtures import child_env, observe_child, observe_terminal
+from tests.tools._child_env_fixtures import child_env, observe_child, observe_terminal, windows_home_env
 from tools.environments import local
 from tools.environments import local_pythonpath as pp
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_BLOCKLIST
-
 
 def _running_venv_site_packages() -> Path:
     """Independently construct the host-native venv site-packages path."""
@@ -865,6 +864,7 @@ class TestNativeEnvironmentContracts:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "PYTHONPATH": os.pathsep.join([venv_sp, "/home/user/my-lib"]),
+            **windows_home_env(),
         }
         with patch.dict(os.environ, seed, clear=True):
             if builder == "_make_run_env":
@@ -1287,6 +1287,7 @@ class TestPythonhomeSanitized:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "PYTHONHOME": "/opt/hermes-venv",
+            **windows_home_env(),
         }
         with patch.dict(os.environ, seed, clear=True):
             if builder == "_make_run_env":
@@ -1532,7 +1533,7 @@ class TestSanePathIncludesHomebrew:
         from tools.environments import local as local_mod
         from tools.environments.local import _SANE_PATH, _make_run_env
         monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", list)
-        minimal_env = {"PATH": "/some/custom/bin"}
+        minimal_env = {"PATH": "/some/custom/bin", **windows_home_env()}
         with patch.dict(os.environ, minimal_env, clear=True):
             result = _make_run_env({})
         path_entries = result["PATH"].split(os.pathsep)

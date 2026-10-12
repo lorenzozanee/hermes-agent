@@ -12,6 +12,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from tests.tools._child_env_fixtures import windows_home_env
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
@@ -19,7 +20,6 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
 )
-
 
 @pytest.fixture()
 def registry():
@@ -863,9 +863,6 @@ class TestFinishedHandleRelease:
 
         assert session.id not in registry._finished
         assert pty_closed["closed"], "pruned session must release its PTY handle"
-
-
-
 # =========================================================================
 # Spawn env sanitization
 # =========================================================================
@@ -889,6 +886,7 @@ class TestSpawnEnvSanitization:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "USER": "tester",
+            **windows_home_env(),
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
