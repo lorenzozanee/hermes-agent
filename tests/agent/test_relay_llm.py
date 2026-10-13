@@ -402,6 +402,69 @@ def test_managed_stream_delivers_each_chunk_before_the_provider_sends_the_next(r
     assert list(stream) == [{"delta": "second"}]
 
 
+@pytest.mark.parametrize("phase", ["initialization", "iteration"])
+def test_managed_stream_surfaces_proactor_self_pipe_abort(relay_turn, monkeypatch, phase):
+    """A Windows Proactor self-pipe abort must escape and clean up the private Relay loop."""
+    relay, _turn = relay_turn
+    error = ConnectionResetError(995, "I/O operation aborted")
+    error.winerror = 995
+    cleaned = threading.Event()
+
+    def report_abort(loop):
+        loop.call_exception_handler({
+            "message": "Error on reading from the event loop self pipe",
+            "exception": error,
+        })
+        # Bound the pre-fix path, where asyncio only logs the callback error.
+        loop.call_later(0.01, loop.stop)
+
+    async def stream_with_aborted_self_pipe(*_args, **_kwargs):
+        async def generate():
+            try:
+                if phase == "iteration":
+                    report_abort(asyncio.get_running_loop())
+                    await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+            yield {"delta": "unreachable"}
+
+        if phase == "initialization":
+            report_abort(asyncio.get_running_loop())
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+        return generate()
+
+    monkeypatch.setattr(relay.llm, "stream_execute", stream_with_aborted_self_pipe)
+    if phase == "initialization":
+        with pytest.raises(ConnectionResetError) as raised:
+            relay_llm.stream(
+                {"payload": "self-pipe-abort"},
+                lambda _request: iter(()),
+                session_id="session-1",
+                name="self-pipe-abort",
+                model_name="test-model",
+                finalizer=lambda: {"content": "unreachable"},
+                metadata={"api_mode": "bedrock_converse", "api_request_id": "self-pipe-abort"},
+            )
+    else:
+        stream = relay_llm.stream(
+            {"payload": "self-pipe-abort"},
+            lambda _request: iter(()),
+            session_id="session-1",
+            name="self-pipe-abort",
+            model_name="test-model",
+            finalizer=lambda: {"content": "unreachable"},
+            metadata={"api_mode": "bedrock_converse", "api_request_id": "self-pipe-abort"},
+        )
+        with pytest.raises(ConnectionResetError) as raised:
+            next(stream)
+
+    assert raised.value is error
+    assert cleaned.wait(timeout=2)
+
+
 def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
     relay, turn = relay_turn
     captured_requests = []

@@ -326,6 +326,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._completed_response_predicate = completed_response_predicate
         self._raw_chunks: list[tuple[Any, Any]] = []
         self._prefetched_chunks: list[Any] = []
+        self._loop_exception: OSError | None = None
         attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
         if attempt is None:
             self._start_unmanaged(request)
@@ -410,6 +411,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._runtime_lease = attempt.runtime.acquire_operation_lease()
         try:
             self._loop = loop = asyncio.new_event_loop()
+            loop.set_exception_handler(self._handle_loop_exception)
             self._stream = loop.run_until_complete(
                 attempt.run_managed(
                     attempt.runtime.relay.llm.stream_execute, partial(self._provider_stream, attempt),
@@ -417,6 +419,22 @@ class ManagedLlmStream(Iterator[Any]):
                 )
             )
         except BaseException as exc:
+            loop_error = self._take_loop_exception(exc)
+            if loop_error is not None:
+                try:
+                    if self._loop is not None:
+                        try:
+                            tasks_cancelled = self._cancel_loop_tasks(self._loop)
+                        except KeyboardInterrupt:
+                            self._finish_logical("cancelled")
+                            raise
+                        self._finish_logical("failed", error=loop_error)
+                        if tasks_cancelled:
+                            self._loop.close()
+                finally:
+                    self._loop = None
+                    self._release_runtime_lease()
+                raise loop_error from None
             if self._loop is not None and self._recoverable_relay_failure(exc):
                 self._preserve_pending_provider_chunks()
                 return
@@ -428,6 +446,60 @@ class ManagedLlmStream(Iterator[Any]):
                 self._loop = None
                 self._release_runtime_lease()
             raise
+
+    def _handle_loop_exception(self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        error = context.get("exception")
+        if (
+            context.get("message") == "Error on reading from the event loop self pipe"
+            and isinstance(error, OSError)
+            and getattr(error, "winerror", None) == 995
+        ):
+            self._loop_exception = error
+            loop.default_exception_handler(context)
+            loop.stop()
+            return
+        loop.default_exception_handler(context)
+
+    def _take_loop_exception(self, exc: BaseException) -> OSError | None:
+        if isinstance(exc, RuntimeError) and str(exc) == "Event loop stopped before Future completed.":
+            error, self._loop_exception = self._loop_exception, None
+            return error
+        return None
+
+    @staticmethod
+    def _cancel_loop_tasks(loop: asyncio.AbstractEventLoop) -> bool:
+        def cancel_and_wait() -> None:
+            tasks = asyncio.all_tasks(loop)
+            if not tasks:
+                return
+            for task in tasks:
+                task.cancel()
+
+            async def wait_for_tasks() -> None:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                        logger.warning("Relay task failed while cleaning up a stopped stream loop: %s", result)
+
+            loop.run_until_complete(wait_for_tasks())
+
+        try:
+            relay_runtime._run_on_daemon_thread(
+                cancel_and_wait,
+                name="relay-llm-loop-task-cancel",
+                timeout=_ACLOSE_TIMEOUT,
+                timeout_message="Relay loop tasks did not cancel; abandoning the private loop",
+            )
+        except TimeoutError:
+            logger.warning(
+                "Relay loop task cancellation exceeded %ss; abandoning the private loop",
+                _ACLOSE_TIMEOUT,
+            )
+            return False
+        except (Exception, asyncio.CancelledError):
+            logger.warning("Relay loop task cancellation failed; abandoning the private loop", exc_info=True)
+            return False
+        return True
 
     def __iter__(self) -> ManagedLlmStream:
         return self
@@ -504,6 +576,24 @@ class ManagedLlmStream(Iterator[Any]):
             self._close(logical_outcome="cancelled")
             raise StopIteration from None
         except BaseException as exc:
+            loop_error = self._take_loop_exception(exc)
+            if loop_error is not None:
+                try:
+                    tasks_cancelled = self._cancel_loop_tasks(self._loop)
+                except KeyboardInterrupt:
+                    self._closed = True
+                    self._loop = None
+                    self._finish_logical("cancelled")
+                    self._release_runtime_lease()
+                    raise
+                if not tasks_cancelled:
+                    self._closed = True
+                    self._loop = None
+                    self._finish_logical("failed", error=loop_error)
+                    self._release_runtime_lease()
+                    raise loop_error from None
+                self._close(logical_outcome="failed", error=loop_error)
+                raise loop_error from None
             callback_error = self._callback_error
             if callback_error is not None and relay_runtime._is_relay_wrapped_callback_error(exc, callback_error):
                 self._close(logical_outcome="failed", error=callback_error)
