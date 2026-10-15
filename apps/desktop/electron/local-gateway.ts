@@ -434,7 +434,19 @@ export async function mintLocalGatewayTicket(endpoint: GatewayEndpoint, purpose:
   const groupWritable: string[] = []
 
   for (const dir of new Set([home, controlHome])) {
-    if (await fs.realpath(dir) !== dir) {throw new Error('Noncanonical gateway profile')}
+    const canonical = await fs.realpath(dir)
+
+    if (canonical !== dir) {
+      if (process.platform !== 'darwin' || canonical.toLowerCase() !== dir.toLowerCase()) {throw new Error('Noncanonical gateway profile')}
+
+      let current = path.parse(dir).root
+
+      for (const component of dir.slice(current.length).split(path.sep).filter(Boolean)) {
+        current = path.join(current, component)
+
+        if ((await fs.lstat(current)).isSymbolicLink()) {throw new Error('Noncanonical gateway profile')}
+      }
+    }
 
     if (await privateNode(dir, 'home')) {groupWritable.push(dir)}
   }
