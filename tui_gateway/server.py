@@ -1272,6 +1272,9 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
 # Only the newest marker is meaningful (it names the *currently* active model); older ones are stale and
 # would otherwise be re-sent to the provider on every turn (#65891).
 _MODEL_SWITCH_MARKER_PREFIX = "[System: The active model for this chat has changed to "
+_MODEL_SWITCH_MARKER_END = (
+    "From this point forward, use this runtime metadata when answering questions about what model/provider is active.]"
+)
 
 
 def _is_model_switch_marker(entry: Any) -> bool:
@@ -1280,6 +1283,25 @@ def _is_model_switch_marker(entry: Any) -> bool:
         return False
     content = entry.get("content")
     return isinstance(content, str) and content.startswith(_MODEL_SWITCH_MARKER_PREFIX)
+
+
+def _preserve_user_content_after_model_switch_marker(entry: Any) -> bool:
+    """Strip a merged marker while keeping the user message that follows it."""
+    content = entry.get("content") if isinstance(entry, dict) else None
+    if not isinstance(content, str):
+        return False
+    marker_end = content.find(_MODEL_SWITCH_MARKER_END, len(_MODEL_SWITCH_MARKER_PREFIX))
+    if marker_end == -1:
+        return False
+    separator = marker_end + len(_MODEL_SWITCH_MARKER_END)
+    if content[separator : separator + 2] != "\n\n":
+        return False
+    prompt = content[separator + 2 :]
+    if not prompt:
+        return False
+    entry["content"] = prompt
+    entry.pop("display_kind", None)
+    return True
 
 
 def _is_pivot_marker(entry: Any) -> bool:
@@ -1299,15 +1321,16 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     if not session_key:
         return
     provider_part = f" via provider {provider}" if provider else ""
-    marker = (
-        f"{_MODEL_SWITCH_MARKER_PREFIX}{model}{provider_part}. From this point forward, use this runtime "
-        "metadata when answering questions about what model/provider is active.]")
+    marker = f"{_MODEL_SWITCH_MARKER_PREFIX}{model}{provider_part}. {_MODEL_SWITCH_MARKER_END}"
     # A user message, not system: strict OpenAI-compatible providers (vLLM, Qwen) reject non-leading system messages.
     # See #48338.
     entry: dict[str, Any] = {"role": "user", "content": marker, "display_kind": "model_switch"}
     with session.get("history_lock") or contextlib.nullcontext():
         history = session.setdefault("history", [])
-        history[:] = [h for h in history if not _is_model_switch_marker(h)]
+        history[:] = [
+            h for h in history
+            if not _is_model_switch_marker(h) or _preserve_user_content_after_model_switch_marker(h)
+        ]
         history.append(entry)
         session["history_version"] = int(session.get("history_version", 0)) + 1
     try:
