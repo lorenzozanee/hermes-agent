@@ -68,6 +68,8 @@ def _within_install(home: Path, root: Path) -> bool:
 
 
 def _verified_owner(control: Path, payload: dict) -> tuple[int, Any] | str:
+    import psutil
+
     from gateway.status import _GATEWAY_KIND, _pid_exists, get_process_start_time, start_time_fingerprints_match
     protocol = payload.get("runtime_protocol")
     if type(protocol) is int and protocol > 1:
@@ -77,6 +79,11 @@ def _verified_owner(control: Path, payload: dict) -> tuple[int, Any] | str:
     pid, recorded = payload.get("pid"), payload.get("start_time")
     if (payload.get("kind") != _GATEWAY_KIND or type(pid) is not int or pid <= 1
             or pid in {os.getpid(), os.getppid()} or recorded is None or not _pid_exists(pid)):
+        return "owner_unverified"
+    try:
+        if pid in {ancestor.pid for ancestor in psutil.Process().parents()}:
+            return "owner_unverified"
+    except (psutil.Error, OSError):
         return "owner_unverified"
     current = get_process_start_time(pid)
     try:

@@ -169,3 +169,53 @@ def test_replacement_never_targets_itself(home, monkeypatch):
     monkeypatch.setattr(replace, "_install_root", lambda: home)
     monkeypatch.setattr(replace, "_identify", lambda h, timeout: (home, _owner_payload(home, os.getpid(), 1)))
     assert replace.replace_incompatible_owner(home, deadline=time.monotonic() + 5) == "owner_unverified"
+
+
+def test_verified_owner_refuses_a_gateway_that_is_any_process_ancestor(home, monkeypatch):
+    import psutil
+    from gateway import status
+
+    class Process:
+        def __init__(self, pid=None):
+            self.pid = pid
+
+        def parents(self):
+            return [Process(101), Process(100)]
+
+    monkeypatch.setattr(replace.os, "getpid", lambda: 102)
+    monkeypatch.setattr(replace.os, "getppid", lambda: 101)
+    monkeypatch.setattr(replace, "_install_root", lambda: home)
+    monkeypatch.setattr(psutil, "Process", Process)
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 123)
+    monkeypatch.setattr(status, "start_time_fingerprints_match", lambda recorded, current: True)
+    monkeypatch.setattr(replace, "_identify", lambda h, timeout: (home, _owner_payload(home, 100, 123)))
+    stop_requests = []
+    marker_writes = []
+    monkeypatch.setattr(status, "terminate_pid", lambda *args, **kwargs: stop_requests.append(args))
+    monkeypatch.setattr(status, "_write_marker", lambda *args, **kwargs: marker_writes.append(args))
+
+    import time
+
+    assert replace.replace_incompatible_owner(home, deadline=time.monotonic() + 5) == "owner_unverified"
+    assert stop_requests == []
+    assert marker_writes == []
+
+
+def test_verified_owner_refuses_replacement_when_ancestry_cannot_be_read(home, monkeypatch):
+    import psutil
+    from gateway import status
+
+    class Process:
+        def parents(self):
+            raise psutil.AccessDenied(102)
+
+    monkeypatch.setattr(replace.os, "getpid", lambda: 102)
+    monkeypatch.setattr(replace.os, "getppid", lambda: 101)
+    monkeypatch.setattr(replace, "_install_root", lambda: home)
+    monkeypatch.setattr(psutil, "Process", Process)
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 123)
+    monkeypatch.setattr(status, "start_time_fingerprints_match", lambda recorded, current: True)
+
+    assert replace._verified_owner(home, _owner_payload(home, 100, 123)) == "owner_unverified"
